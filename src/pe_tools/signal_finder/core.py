@@ -214,6 +214,7 @@ class ResidualSignalFinder:
     n_splits: int = 5
     n_repeats: int = 1
     sample_fraction: float = 0.8
+    offbalance: bool = False
     stratify_col: str | None = None
     group_col: str | None = None
     random_state: int | None = None
@@ -309,6 +310,8 @@ class ResidualSignalFinder:
             model.fit(X_train, y_train, **fit_kwargs)
             train_pred = model.predict(X_train)
             test_pred = model.predict(X_test)
+            train_pred = self._maybe_offbalance_predictions(train_pred, y_train, train_weight)
+            test_pred = self._maybe_offbalance_predictions(test_pred, y_test, test_weight)
             oof_predictions.iloc[test_idx] = test_pred
 
             train_r2 = float(r2_score(y_train, train_pred, sample_weight=train_weight))
@@ -357,6 +360,7 @@ class ResidualSignalFinder:
             context.diagnostic_X,
             context.model_target,
             oof_predictions,
+            task_type=context.task_type,
         )
         residual_model_score = {
             "mean_train_r2": float(fold_scores_frame["train_r2"].mean()),
@@ -416,6 +420,11 @@ class ResidualSignalFinder:
         fit_kwargs = {"sample_weight": train_weight} if train_weight is not None else {}
         model.fit(X.iloc[train_idx], context.model_target.iloc[train_idx], **fit_kwargs)
         train_pred = model.predict(X.iloc[train_idx])
+        train_pred = self._maybe_offbalance_predictions(
+            train_pred,
+            context.model_target.iloc[train_idx],
+            train_weight,
+        )
         train_r2 = float(
             r2_score(context.model_target.iloc[train_idx], train_pred, sample_weight=train_weight)
         )
@@ -427,6 +436,11 @@ class ResidualSignalFinder:
             test_idx = np.flatnonzero(test_mask.to_numpy())
             test_weight = sample_weight[test_idx] if sample_weight is not None else None
             test_pred = model.predict(X.iloc[test_idx])
+            test_pred = self._maybe_offbalance_predictions(
+                test_pred,
+                context.model_target.iloc[test_idx],
+                test_weight,
+            )
             predictions.iloc[test_idx] = test_pred
             test_r2 = float(
                 r2_score(context.model_target.iloc[test_idx], test_pred, sample_weight=test_weight)
@@ -467,6 +481,7 @@ class ResidualSignalFinder:
             context.diagnostic_X.loc[eval_mask],
             context.model_target.loc[eval_mask],
             predictions.loc[eval_mask],
+            task_type=context.task_type,
         )
         residual_model_score = {
             "train_r2": train_r2,
@@ -530,6 +545,16 @@ class ResidualSignalFinder:
             model.fit(X.iloc[train_idx], context.model_target.iloc[train_idx], **fit_kwargs)
             train_pred = model.predict(X.iloc[train_idx])
             test_pred = model.predict(X.iloc[test_idx])
+            train_pred = self._maybe_offbalance_predictions(
+                train_pred,
+                context.model_target.iloc[train_idx],
+                train_weight,
+            )
+            test_pred = self._maybe_offbalance_predictions(
+                test_pred,
+                context.model_target.iloc[test_idx],
+                test_weight,
+            )
 
             train_r2 = float(
                 r2_score(
@@ -593,6 +618,7 @@ class ResidualSignalFinder:
             context.diagnostic_X,
             context.model_target,
             predictions,
+            task_type=context.task_type,
         )
         residual_model_score = {
             "mean_train_r2": float(fold_scores_frame["train_r2"].mean()),
@@ -638,6 +664,7 @@ class ResidualSignalFinder:
             "n_splits": self.n_splits,
             "n_repeats": self.n_repeats,
             "sample_fraction": self.sample_fraction,
+            "offbalance": self.offbalance,
             "stratify_col": self.stratify_col,
             "group_col": self.group_col,
             "random_state": self.random_state,
@@ -754,6 +781,16 @@ class ResidualSignalFinder:
         params.update(self.model_params or {})
         return RandomForestRegressor(**params)
 
+    def _maybe_offbalance_predictions(
+        self,
+        predictions: np.ndarray[Any, Any],
+        target: pd.Series,
+        sample_weight: np.ndarray[Any, Any] | None,
+    ) -> np.ndarray[Any, Any]:
+        if not self.offbalance:
+            return predictions
+        return _offbalance_predictions(predictions, target, sample_weight)
+
     def _feature_importance(
         self,
         model: Any,
@@ -813,6 +850,8 @@ class ResidualSignalFinder:
         X: pd.DataFrame,
         observed: pd.Series,
         predictions: pd.Series,
+        *,
+        task_type: str,
     ) -> dict[str, pd.DataFrame]:
         diagnostics = {}
         for feature in X.columns:
@@ -826,18 +865,24 @@ class ResidualSignalFinder:
             source["prediction_error"] = source["actual"] - source["predicted"]
             bin_count = min(self.n_bins, source["feature_value"].nunique())
             source["bin"] = pd.qcut(source["feature_value"], q=bin_count, duplicates="drop")
+            aggregations = {
+                "n_obs": ("actual", "size"),
+                "feature_mean": ("feature_value", "mean"),
+                "actual_mean": ("actual", "mean"),
+                "predicted_mean": ("predicted", "mean"),
+                "error_mean": ("prediction_error", "mean"),
+            }
+            if task_type != "binary_classification":
+                aggregations.update(
+                    {
+                        "residual_mean": ("actual", "mean"),
+                        "predicted_residual_mean": ("predicted", "mean"),
+                        "prediction_error_mean": ("prediction_error", "mean"),
+                    }
+                )
             feature_diagnostics = (
                 source.groupby("bin", observed=True)
-                .agg(
-                    n_obs=("actual", "size"),
-                    feature_mean=("feature_value", "mean"),
-                    actual_mean=("actual", "mean"),
-                    predicted_mean=("predicted", "mean"),
-                    error_mean=("prediction_error", "mean"),
-                    residual_mean=("actual", "mean"),
-                    predicted_residual_mean=("predicted", "mean"),
-                    prediction_error_mean=("prediction_error", "mean"),
-                )
+                .agg(**aggregations)
                 .reset_index()
             )
             diagnostics[str(feature)] = feature_diagnostics
@@ -932,6 +977,22 @@ def _filter_public_interactions(
         public_features
     )
     return interactions.loc[mask].copy()
+
+
+def _offbalance_predictions(
+    predictions: np.ndarray[Any, Any],
+    target: pd.Series,
+    sample_weight: np.ndarray[Any, Any] | None,
+) -> np.ndarray[Any, Any]:
+    adjusted = np.asarray(predictions, dtype=float).copy()
+    target_values = target.to_numpy(dtype=float)
+    if sample_weight is None or np.isclose(float(np.sum(sample_weight)), 0.0):
+        target_level = float(np.mean(target_values))
+        prediction_level = float(np.mean(adjusted))
+    else:
+        target_level = float(np.average(target_values, weights=sample_weight))
+        prediction_level = float(np.average(adjusted, weights=sample_weight))
+    return adjusted + (target_level - prediction_level)
 
 
 def _coerce_series(values: LabelLike, *, name: str, index: pd.Index) -> pd.Series:

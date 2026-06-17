@@ -22,3 +22,9 @@ print(result.correlation)
 
 The implementation is intentionally small: pandas for data handling,
 scikit-learn for linear residualization, and a lightweight result object.
+
+`ResidualSignalFinder` can also scan model errors directly. For 0/1 targets it
+automatically treats the task as classification, models the target again with
+the original prediction included as a control, and emits a warning describing
+that behavior. Set `offbalance=True` to level held-out predictions to the target
+mean within each split before scoring and binned diagnostics.

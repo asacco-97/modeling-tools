@@ -359,6 +359,27 @@ def test_output_is_reproducible_with_fixed_random_state() -> None:
     assert first.residual_model_score == second.residual_model_score
 
 
+def test_offbalance_levels_predictions_to_target_across_cv_splits() -> None:
+    data = make_synthetic_residual_data()
+    finder = ResidualSignalFinder(
+        n_estimators=20,
+        n_splits=4,
+        offbalance=True,
+        random_state=42,
+    )
+
+    result = finder.fit(X=data.X, y_true=data.y_true, y_pred=data.y_pred)
+    diagnostics = result.binned_diagnostics["residual_signal"]
+    row_count = diagnostics["n_obs"].sum()
+    actual_mean = float((diagnostics["actual_mean"] * diagnostics["n_obs"]).sum() / row_count)
+    predicted_mean = float(
+        (diagnostics["predicted_mean"] * diagnostics["n_obs"]).sum() / row_count
+    )
+
+    assert result.metadata["offbalance"] is True
+    assert actual_mean == pytest.approx(predicted_mean)
+
+
 def test_categorical_columns_are_rejected_with_clear_error_for_v1() -> None:
     data = make_synthetic_residual_data()
     X = data.X.copy()
@@ -417,6 +438,9 @@ def test_binary_target_importance_and_diagnostics_focus_on_public_features() -> 
     assert set(result.binned_diagnostics) == set(X.columns)
     diagnostics = result.binned_diagnostics["residual_signal"]
     assert {"actual_mean", "predicted_mean", "error_mean"}.issubset(diagnostics.columns)
+    assert "residual_mean" not in diagnostics.columns
+    assert "predicted_residual_mean" not in diagnostics.columns
+    assert "prediction_error_mean" not in diagnostics.columns
     assert diagnostics["actual_mean"].between(0.0, 1.0).all()
 
 
