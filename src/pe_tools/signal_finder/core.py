@@ -4,7 +4,7 @@ import html
 import json
 import re
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, TypeAlias
 
@@ -21,6 +21,7 @@ ModelType = Literal["xgboost", "random_forest"]
 SplitStrategy = Literal["cv", "holdout", "group_cv", "bootstrap"]
 VALID_MODEL_TYPES = {"xgboost", "random_forest"}
 VALID_SPLIT_STRATEGIES = {"cv", "holdout", "group_cv", "bootstrap"}
+INTERACTION_IMPORTANCE_COLUMNS = ["feature_1", "feature_2", "importance", "rank"]
 SeriesLike: TypeAlias = pd.Series | np.ndarray[Any, Any] | Sequence[float]
 LabelLike: TypeAlias = pd.Series | np.ndarray[Any, Any] | Sequence[Any]
 
@@ -33,6 +34,9 @@ class ResidualSignalResult:
     signal_residual: pd.Series
     correlation: float
     n_obs: int
+    interaction_importance: pd.DataFrame = field(
+        default_factory=lambda: pd.DataFrame(columns=INTERACTION_IMPORTANCE_COLUMNS)
+    )
 
 
 @dataclass(frozen=True)
@@ -48,6 +52,9 @@ class ResidualSignalFinderResult:
     fold_feature_importance: pd.DataFrame
     metadata: dict[str, Any]
     models: list[Any]
+    interaction_importance: pd.DataFrame = field(
+        default_factory=lambda: pd.DataFrame(columns=INTERACTION_IMPORTANCE_COLUMNS)
+    )
 
     def to_excel(self, path: str | Path) -> Path:
         """Write the result report to an Excel workbook."""
@@ -62,6 +69,7 @@ class ResidualSignalFinderResult:
             with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
                 write_sheet(_summary_frame(self), "summary", writer)
                 write_sheet(self.feature_importance, "feature_importance", writer)
+                write_sheet(self.interaction_importance, "interaction_importance", writer)
                 write_sheet(self.feature_stability, "feature_stability", writer)
                 write_sheet(self.fold_scores, "fold_scores", writer)
                 write_sheet(self.fold_feature_importance, "fold_feature_importance", writer)
@@ -251,8 +259,10 @@ class ResidualSignalFinder:
         feature_names = list(model_X.columns)
         fold_scores: list[dict[str, Any]] = []
         fold_importance_frames: list[pd.DataFrame] = []
+        fold_interaction_frames: list[pd.DataFrame] = []
         models: list[Any] = []
         oof_predictions = pd.Series(np.nan, index=X_valid.index, name="predicted_residual")
+        shap_module, interaction_warnings = _load_shap_for_interactions(self.max_depth)
 
         for fold, (train_idx, test_idx) in enumerate(self._cv_splits(model_X, groups)):
             X_train = model_X.iloc[train_idx]
@@ -285,12 +295,23 @@ class ResidualSignalFinder:
                 }
             )
             fold_importance_frames.append(self._feature_importance(model, feature_names, fold))
+            interaction_frame = _fold_interaction_importance(
+                shap_module=shap_module,
+                model=model,
+                X_eval=X_test,
+                feature_names=feature_names,
+                fold=fold,
+                random_state=self.random_state,
+            )
+            if not interaction_frame.empty:
+                fold_interaction_frames.append(interaction_frame)
             models.append(model)
 
         fold_scores_frame = pd.DataFrame(fold_scores)
         fold_feature_importance = pd.concat(fold_importance_frames, ignore_index=True)
         feature_importance = self._aggregate_feature_importance(fold_feature_importance)
         feature_stability = self._feature_stability(fold_feature_importance)
+        interaction_importance = _aggregate_interaction_importance(fold_interaction_frames)
         binned_diagnostics = self._binned_diagnostics(model_X, residuals, oof_predictions)
         residual_model_score = {
             "mean_train_r2": float(fold_scores_frame["train_r2"].mean()),
@@ -305,8 +326,9 @@ class ResidualSignalFinder:
             residual_model_score=residual_model_score,
             fold_scores=fold_scores_frame,
             fold_feature_importance=fold_feature_importance,
-            metadata=self._metadata(sample_weight is not None),
+            metadata=self._metadata(sample_weight is not None, warnings=interaction_warnings),
             models=models,
+            interaction_importance=interaction_importance,
         )
 
     def _fit_holdout(
@@ -374,6 +396,19 @@ class ResidualSignalFinder:
         fold_feature_importance = self._feature_importance(model, feature_names, 0)
         feature_importance = self._aggregate_feature_importance(fold_feature_importance)
         feature_stability = self._feature_stability(fold_feature_importance)
+        shap_module, interaction_warnings = _load_shap_for_interactions(self.max_depth)
+        interaction_importance = _aggregate_interaction_importance(
+            [
+                _fold_interaction_importance(
+                    shap_module=shap_module,
+                    model=model,
+                    X_eval=X.loc[split_labels.isin(["validation", "holdout"])],
+                    feature_names=feature_names,
+                    fold=0,
+                    random_state=self.random_state,
+                )
+            ]
+        )
         eval_mask = split_labels.isin(["validation", "holdout"])
         binned_diagnostics = self._binned_diagnostics(
             X.loc[eval_mask],
@@ -396,8 +431,9 @@ class ResidualSignalFinder:
             residual_model_score=residual_model_score,
             fold_scores=fold_scores_frame,
             fold_feature_importance=fold_feature_importance,
-            metadata=self._metadata(sample_weight_used),
+            metadata=self._metadata(sample_weight_used, warnings=interaction_warnings),
             models=[model],
+            interaction_importance=interaction_importance,
         )
 
     def _fit_bootstrap(
@@ -414,9 +450,11 @@ class ResidualSignalFinder:
         feature_names = list(X.columns)
         fold_scores: list[dict[str, Any]] = []
         fold_importance_frames: list[pd.DataFrame] = []
+        fold_interaction_frames: list[pd.DataFrame] = []
         models: list[Any] = []
         prediction_sum = pd.Series(0.0, index=X.index, name="predicted_residual")
         prediction_count = pd.Series(0, index=X.index, name="prediction_count")
+        shap_module, interaction_warnings = _load_shap_for_interactions(self.max_depth)
 
         for repeat in range(self.n_repeats):
             train_idx = rng.choice(row_count, size=train_size, replace=True)
@@ -452,6 +490,16 @@ class ResidualSignalFinder:
                 }
             )
             fold_importance_frames.append(self._feature_importance(model, feature_names, repeat))
+            interaction_frame = _fold_interaction_importance(
+                shap_module=shap_module,
+                model=model,
+                X_eval=X.iloc[test_idx],
+                feature_names=feature_names,
+                fold=repeat,
+                random_state=self.random_state,
+            )
+            if not interaction_frame.empty:
+                fold_interaction_frames.append(interaction_frame)
             models.append(model)
             prediction_sum.iloc[test_idx] = prediction_sum.iloc[test_idx] + test_pred
             prediction_count.iloc[test_idx] = prediction_count.iloc[test_idx] + 1
@@ -463,6 +511,7 @@ class ResidualSignalFinder:
         fold_feature_importance = pd.concat(fold_importance_frames, ignore_index=True)
         feature_importance = self._aggregate_feature_importance(fold_feature_importance)
         feature_stability = self._feature_stability(fold_feature_importance)
+        interaction_importance = _aggregate_interaction_importance(fold_interaction_frames)
         predictions = prediction_sum / prediction_count.replace(0, np.nan)
         binned_diagnostics = self._binned_diagnostics(X, residuals, predictions)
         residual_model_score = {
@@ -479,11 +528,16 @@ class ResidualSignalFinder:
             residual_model_score=residual_model_score,
             fold_scores=fold_scores_frame,
             fold_feature_importance=fold_feature_importance,
-            metadata=self._metadata(sample_weight_used),
+            metadata=self._metadata(sample_weight_used, warnings=interaction_warnings),
             models=models,
+            interaction_importance=interaction_importance,
         )
 
-    def _metadata(self, sample_weight_used: bool) -> dict[str, Any]:
+    def _metadata(
+        self,
+        sample_weight_used: bool,
+        warnings: Sequence[str] = (),
+    ) -> dict[str, Any]:
         return {
             "model_type": self.model_type,
             "max_depth": self.max_depth,
@@ -498,6 +552,7 @@ class ResidualSignalFinder:
             "group_col": self.group_col,
             "random_state": self.random_state,
             "sample_weight_used": sample_weight_used,
+            "warnings": list(warnings),
         }
 
     def _validate_fit_inputs(
@@ -744,6 +799,79 @@ def _map_xgboost_importance(
             if feature_index < len(feature_names):
                 importance[feature_names[feature_index]] = float(score)
     return importance
+
+
+def _load_shap_for_interactions(max_depth: int) -> tuple[Any | None, list[str]]:
+    if max_depth != 2:
+        return None, []
+    try:
+        import shap
+    except ImportError:
+        return None, ["SHAP is not installed; interaction_importance skipped."]
+    return shap, []
+
+
+def _empty_interaction_importance() -> pd.DataFrame:
+    return pd.DataFrame(columns=INTERACTION_IMPORTANCE_COLUMNS)
+
+
+def _fold_interaction_importance(
+    *,
+    shap_module: Any | None,
+    model: Any,
+    X_eval: pd.DataFrame,
+    feature_names: list[str],
+    fold: int,
+    random_state: int | None,
+) -> pd.DataFrame:
+    if shap_module is None or X_eval.empty or len(feature_names) < 2:
+        return _empty_interaction_importance()
+
+    sample_size = min(len(X_eval), 200)
+    X_sample = X_eval.sample(
+        n=sample_size,
+        random_state=(random_state or 0) + fold,
+    )
+    explainer = shap_module.TreeExplainer(model)
+    interaction_values = explainer.shap_interaction_values(X_sample)
+    if isinstance(interaction_values, list):
+        interaction_values = interaction_values[0]
+
+    values = np.asarray(interaction_values)
+    if values.ndim == 4:
+        values = values.mean(axis=-1)
+    if values.ndim != 3:
+        return _empty_interaction_importance()
+
+    rows = []
+    for first_index, feature_1 in enumerate(feature_names):
+        for second_index in range(first_index + 1, len(feature_names)):
+            feature_2 = feature_names[second_index]
+            rows.append(
+                {
+                    "fold": fold,
+                    "feature_1": feature_1,
+                    "feature_2": feature_2,
+                    "importance": float(np.abs(values[:, first_index, second_index]).mean()),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _aggregate_interaction_importance(fold_frames: list[pd.DataFrame]) -> pd.DataFrame:
+    usable_frames = [frame for frame in fold_frames if not frame.empty]
+    if not usable_frames:
+        return _empty_interaction_importance()
+
+    aggregated = (
+        pd.concat(usable_frames, ignore_index=True)
+        .groupby(["feature_1", "feature_2"], as_index=False)["importance"]
+        .mean()
+        .sort_values(["importance", "feature_1", "feature_2"], ascending=[False, True, True])
+        .reset_index(drop=True)
+    )
+    aggregated["rank"] = np.arange(1, len(aggregated) + 1)
+    return aggregated.loc[:, INTERACTION_IMPORTANCE_COLUMNS]
 
 
 def _unique_sorted_tuple(values: pd.Series) -> tuple[Any, ...]:
