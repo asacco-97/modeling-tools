@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import html
+import json
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal, TypeAlias
 
 import numpy as np
@@ -43,6 +47,86 @@ class ResidualSignalFinderResult:
     fold_feature_importance: pd.DataFrame
     metadata: dict[str, Any]
     models: list[Any]
+
+    def to_excel(self, path: str | Path) -> Path:
+        """Write the result report to an Excel workbook."""
+        output_path = _validate_report_path(path)
+        used_sheet_names: set[str] = set()
+
+        def write_sheet(frame: pd.DataFrame, sheet_name: str, writer: pd.ExcelWriter) -> None:
+            safe_name = _sanitize_excel_sheet_name(sheet_name, used_sheet_names)
+            _safe_table_for_export(frame).to_excel(writer, sheet_name=safe_name, index=False)
+
+        try:
+            with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+                write_sheet(_summary_frame(self), "summary", writer)
+                write_sheet(self.feature_importance, "feature_importance", writer)
+                write_sheet(self.feature_stability, "feature_stability", writer)
+                write_sheet(self.fold_scores, "fold_scores", writer)
+                write_sheet(self.fold_feature_importance, "fold_feature_importance", writer)
+                for feature in _top_feature_names(self, top_n=None):
+                    table = self.binned_diagnostics.get(feature)
+                    if table is not None:
+                        write_sheet(table, f"binned_{feature}", writer)
+                write_sheet(_dict_frame(self.metadata), "metadata", writer)
+        except OSError as error:
+            raise ValueError(f"Could not write Excel report to {output_path}: {error}") from error
+
+        return output_path
+
+    def to_html(self, path: str | Path, top_n: int = 10) -> Path:
+        """Write a simple HTML report."""
+        if top_n < 1:
+            raise ValueError("top_n must be at least 1")
+
+        output_path = _validate_report_path(path)
+        top_features = _top_feature_names(self, top_n=top_n)
+        diagnostics_sections = []
+        for feature in top_features:
+            table = self.binned_diagnostics.get(feature)
+            if table is not None:
+                diagnostics_sections.append(
+                    f"<h3>{html.escape(feature)}</h3>\n{_html_table(table)}"
+                )
+
+        fold_distribution = self.fold_scores.describe(include="all").reset_index()
+        fold_distribution = fold_distribution.rename(columns={"index": "metric"})
+        content = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Residual Signal Finder Report</title>
+  <style>
+    body {{ font-family: Arial, sans-serif; margin: 2rem; }}
+    table {{ border-collapse: collapse; margin-bottom: 1.5rem; }}
+    th, td {{ border: 1px solid #ddd; padding: 0.35rem 0.5rem; }}
+    th {{ background: #f4f4f4; }}
+  </style>
+</head>
+<body>
+  <h1>Residual Signal Finder Report</h1>
+  <h2>Summary</h2>
+  {_html_table(_summary_frame(self))}
+  <h2>Residual Model Score</h2>
+  {_html_table(_dict_frame(self.residual_model_score))}
+  <h2>Fold Score Distribution</h2>
+  {_html_table(fold_distribution)}
+  <h2>Feature Stability</h2>
+  {_html_table(self.feature_stability)}
+  <h2>Top Feature Binned Diagnostics</h2>
+  {''.join(diagnostics_sections)}
+  <h2>Warnings / Limitations</h2>
+  <p>This minimal v1 report does not include SHAP, plotting, Excel styling,
+  interaction logic, categorical feature handling, or missing-value handling.</p>
+</body>
+</html>
+"""
+        try:
+            output_path.write_text(content, encoding="utf-8")
+        except OSError as error:
+            raise ValueError(f"Could not write HTML report to {output_path}: {error}") from error
+
+        return output_path
 
 
 @dataclass
@@ -629,6 +713,85 @@ def _map_xgboost_importance(
 
 def _unique_sorted_tuple(values: pd.Series) -> tuple[Any, ...]:
     return tuple(sorted(values.dropna().unique().tolist()))
+
+
+def _validate_report_path(path: str | Path) -> Path:
+    output_path = Path(path)
+    if output_path.exists() and output_path.is_dir():
+        raise ValueError(f"Report path must be a file, got directory: {output_path}")
+    if not output_path.parent.exists():
+        raise ValueError(f"Parent directory does not exist for report path: {output_path.parent}")
+    return output_path
+
+
+def _sanitize_excel_sheet_name(sheet_name: str, used_names: set[str]) -> str:
+    cleaned = re.sub(r"[\[\]\:\*\?\/\\]", "_", str(sheet_name)).strip().strip("'")
+    cleaned = re.sub(r"\s+", " ", cleaned) or "sheet"
+    base = cleaned[:31]
+    candidate = base
+    counter = 1
+    while candidate.lower() in used_names:
+        suffix = f"_{counter}"
+        candidate = f"{base[: 31 - len(suffix)]}{suffix}"
+        counter += 1
+    used_names.add(candidate.lower())
+    return candidate
+
+
+def _safe_table_for_export(frame: pd.DataFrame) -> pd.DataFrame:
+    safe_frame = frame.copy()
+    for column in safe_frame.columns:
+        if (
+            pd.api.types.is_numeric_dtype(safe_frame[column])
+            or pd.api.types.is_bool_dtype(safe_frame[column])
+            or pd.api.types.is_datetime64_any_dtype(safe_frame[column])
+            or pd.api.types.is_timedelta64_dtype(safe_frame[column])
+        ):
+            continue
+        safe_frame[column] = safe_frame[column].astype(str)
+    return safe_frame
+
+
+def _dict_frame(values: dict[str, Any]) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "key": list(values.keys()),
+            "value": [_format_report_value(value) for value in values.values()],
+        }
+    )
+
+
+def _summary_frame(result: ResidualSignalFinderResult) -> pd.DataFrame:
+    summary = {
+        "n_observations": len(result.residuals),
+        "n_features": len(result.feature_importance),
+        "n_folds": len(result.fold_scores),
+        "n_models": len(result.models),
+        **{f"score_{key}": value for key, value in result.residual_model_score.items()},
+    }
+    return _dict_frame(summary)
+
+
+def _top_feature_names(result: ResidualSignalFinderResult, top_n: int | None) -> list[str]:
+    if "feature" not in result.feature_importance.columns:
+        features = list(result.binned_diagnostics)
+    else:
+        features = result.feature_importance["feature"].astype(str).tolist()
+    if top_n is None:
+        return [feature for feature in features if feature in result.binned_diagnostics]
+    return [feature for feature in features[:top_n] if feature in result.binned_diagnostics]
+
+
+def _format_report_value(value: Any) -> str:
+    if isinstance(value, float):
+        return f"{value:.10g}"
+    if isinstance(value, int | bool | str) or value is None:
+        return str(value)
+    return json.dumps(value, default=str)
+
+
+def _html_table(frame: pd.DataFrame) -> str:
+    return _safe_table_for_export(frame).to_html(index=False, escape=True)
 
 
 def residualize(values: pd.Series, controls: pd.DataFrame) -> pd.Series:
