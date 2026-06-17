@@ -62,6 +62,7 @@ class ResidualSignalFinderResult:
     interaction_importance: pd.DataFrame = field(
         default_factory=lambda: pd.DataFrame(columns=INTERACTION_IMPORTANCE_COLUMNS)
     )
+    interaction_diagnostics: dict[str, pd.DataFrame] = field(default_factory=dict)
 
     def to_excel(self, path: str | Path) -> Path:
         """Write the result report to an Excel workbook."""
@@ -186,6 +187,36 @@ class ResidualSignalFinderResult:
     ) -> dict[str, Figure]:
         """Alias for plot_top_residual_signals."""
         return self.plot_top_residual_signals(top_n=top_n, save_dir=save_dir)
+
+    def plot_top_interactions(
+        self,
+        top_n: int = 5,
+        save_dir: str | Path | None = None,
+    ) -> dict[str, Figure]:
+        """Plot two-dimensional binned diagnostics for top interactions."""
+        if top_n < 1:
+            raise ValueError("top_n must be at least 1")
+
+        output_dir = _validate_plot_dir(save_dir) if save_dir is not None else None
+        figures: dict[str, Figure] = {}
+        for row in self.interaction_importance.head(top_n).itertuples(index=False):
+            feature_1 = str(row.feature_1)
+            feature_2 = str(row.feature_2)
+            key = _interaction_key(feature_1, feature_2)
+            diagnostics = self.interaction_diagnostics.get(key)
+            if diagnostics is None or diagnostics.empty:
+                continue
+
+            figure = _plot_interaction_diagnostics(feature_1, feature_2, diagnostics)
+            figures[key] = figure
+            if output_dir is not None:
+                figure.savefig(
+                    output_dir / f"{_safe_filename_stem(key)}_interaction.png",
+                    bbox_inches="tight",
+                    dpi=160,
+                )
+
+        return figures
 
 
 @dataclass(frozen=True)
@@ -362,6 +393,12 @@ class ResidualSignalFinder:
             oof_predictions,
             task_type=context.task_type,
         )
+        interaction_diagnostics = self._interaction_diagnostics(
+            context.diagnostic_X,
+            context.model_target,
+            oof_predictions,
+            interaction_importance,
+        )
         residual_model_score = {
             "mean_train_r2": float(fold_scores_frame["train_r2"].mean()),
             "mean_test_r2": float(fold_scores_frame["test_r2"].mean()),
@@ -384,6 +421,7 @@ class ResidualSignalFinder:
             ),
             models=models,
             interaction_importance=interaction_importance,
+            interaction_diagnostics=interaction_diagnostics,
         )
 
     def _fit_holdout(
@@ -483,6 +521,12 @@ class ResidualSignalFinder:
             predictions.loc[eval_mask],
             task_type=context.task_type,
         )
+        interaction_diagnostics = self._interaction_diagnostics(
+            context.diagnostic_X.loc[eval_mask],
+            context.model_target.loc[eval_mask],
+            predictions.loc[eval_mask],
+            interaction_importance,
+        )
         residual_model_score = {
             "train_r2": train_r2,
             "mean_test_r2": float(fold_scores_frame["test_r2"].mean()),
@@ -508,6 +552,7 @@ class ResidualSignalFinder:
             ),
             models=[model],
             interaction_importance=interaction_importance,
+            interaction_diagnostics=interaction_diagnostics,
         )
 
     def _fit_bootstrap(
@@ -620,6 +665,12 @@ class ResidualSignalFinder:
             predictions,
             task_type=context.task_type,
         )
+        interaction_diagnostics = self._interaction_diagnostics(
+            context.diagnostic_X,
+            context.model_target,
+            predictions,
+            interaction_importance,
+        )
         residual_model_score = {
             "mean_train_r2": float(fold_scores_frame["train_r2"].mean()),
             "mean_test_r2": float(fold_scores_frame["test_r2"].mean()),
@@ -643,6 +694,7 @@ class ResidualSignalFinder:
             ),
             models=models,
             interaction_importance=interaction_importance,
+            interaction_diagnostics=interaction_diagnostics,
         )
 
     def _metadata(
@@ -785,11 +837,11 @@ class ResidualSignalFinder:
         self,
         predictions: np.ndarray[Any, Any],
         target: pd.Series,
-        sample_weight: np.ndarray[Any, Any] | None,
+        _sample_weight: np.ndarray[Any, Any] | None,
     ) -> np.ndarray[Any, Any]:
         if not self.offbalance:
             return predictions
-        return _offbalance_predictions(predictions, target, sample_weight)
+        return _offbalance_predictions(predictions, target)
 
     def _feature_importance(
         self,
@@ -888,6 +940,63 @@ class ResidualSignalFinder:
             diagnostics[str(feature)] = feature_diagnostics
         return diagnostics
 
+    def _interaction_diagnostics(
+        self,
+        X: pd.DataFrame,
+        observed: pd.Series,
+        predictions: pd.Series,
+        interaction_importance: pd.DataFrame,
+    ) -> dict[str, pd.DataFrame]:
+        diagnostics: dict[str, pd.DataFrame] = {}
+        if interaction_importance.empty:
+            return diagnostics
+
+        for row in interaction_importance.itertuples(index=False):
+            feature_1 = str(row.feature_1)
+            feature_2 = str(row.feature_2)
+            if feature_1 not in X.columns or feature_2 not in X.columns:
+                continue
+
+            source = pd.DataFrame(
+                {
+                    "feature_1_value": X[feature_1],
+                    "feature_2_value": X[feature_2],
+                    "actual": observed,
+                    "predicted": predictions,
+                }
+            ).dropna()
+            if source.empty:
+                continue
+
+            source["error"] = source["actual"] - source["predicted"]
+            feature_1_bins = min(self.n_bins, source["feature_1_value"].nunique())
+            feature_2_bins = min(self.n_bins, source["feature_2_value"].nunique())
+            source["feature_1_bin"] = pd.qcut(
+                source["feature_1_value"],
+                q=feature_1_bins,
+                duplicates="drop",
+            )
+            source["feature_2_bin"] = pd.qcut(
+                source["feature_2_value"],
+                q=feature_2_bins,
+                duplicates="drop",
+            )
+
+            diagnostics[_interaction_key(feature_1, feature_2)] = (
+                source.groupby(["feature_1_bin", "feature_2_bin"], observed=True)
+                .agg(
+                    n_obs=("actual", "size"),
+                    feature_1_mean=("feature_1_value", "mean"),
+                    feature_2_mean=("feature_2_value", "mean"),
+                    actual_mean=("actual", "mean"),
+                    predicted_mean=("predicted", "mean"),
+                    error_mean=("error", "mean"),
+                )
+                .reset_index()
+            )
+
+        return diagnostics
+
 
 def _make_modeling_context(
     *,
@@ -979,19 +1088,18 @@ def _filter_public_interactions(
     return interactions.loc[mask].copy()
 
 
+def _interaction_key(feature_1: str, feature_2: str) -> str:
+    return f"{feature_1}__x__{feature_2}"
+
+
 def _offbalance_predictions(
     predictions: np.ndarray[Any, Any],
     target: pd.Series,
-    sample_weight: np.ndarray[Any, Any] | None,
 ) -> np.ndarray[Any, Any]:
     adjusted = np.asarray(predictions, dtype=float).copy()
     target_values = target.to_numpy(dtype=float)
-    if sample_weight is None or np.isclose(float(np.sum(sample_weight)), 0.0):
-        target_level = float(np.mean(target_values))
-        prediction_level = float(np.mean(adjusted))
-    else:
-        target_level = float(np.average(target_values, weights=sample_weight))
-        prediction_level = float(np.average(adjusted, weights=sample_weight))
+    target_level = float(np.mean(target_values))
+    prediction_level = float(np.mean(adjusted))
     return adjusted + (target_level - prediction_level)
 
 
@@ -1265,6 +1373,60 @@ def _plot_binned_diagnostics(feature: str, diagnostics: pd.DataFrame) -> Figure:
     axes.set_xticklabels(x_labels, rotation=45, ha="right")
     axes.legend()
     axes.grid(True, alpha=0.25)
+    figure.tight_layout()
+    return figure
+
+
+def _plot_interaction_diagnostics(
+    feature_1: str,
+    feature_2: str,
+    diagnostics: pd.DataFrame,
+) -> Figure:
+    required_columns = {
+        "feature_1_bin",
+        "feature_2_bin",
+        "actual_mean",
+        "predicted_mean",
+        "error_mean",
+    }
+    missing_columns = sorted(required_columns - set(diagnostics.columns))
+    if missing_columns:
+        raise ValueError(f"interaction diagnostics missing columns: {missing_columns}")
+
+    figure = Figure(figsize=(15, 4.8))
+    axes = figure.subplots(1, 3)
+    plot_specs = [
+        ("actual_mean", "Mean actual", "viridis", None),
+        ("predicted_mean", "Mean predicted", "viridis", None),
+        ("error_mean", "Mean error", "coolwarm", "center"),
+    ]
+    for axes_index, (column, title, cmap, scale) in enumerate(plot_specs):
+        pivot = diagnostics.pivot(
+            index="feature_2_bin",
+            columns="feature_1_bin",
+            values=column,
+        )
+        values = pivot.to_numpy(dtype=float)
+        vmin = vmax = None
+        if scale == "center" and not np.isnan(values).all():
+            max_abs = float(np.nanmax(np.abs(values)))
+            vmin = -max_abs
+            vmax = max_abs
+        image = axes[axes_index].imshow(values, aspect="auto", cmap=cmap, vmin=vmin, vmax=vmax)
+        axes[axes_index].set_title(title)
+        axes[axes_index].set_xlabel(feature_1)
+        axes[axes_index].set_ylabel(feature_2)
+        axes[axes_index].set_xticks(np.arange(len(pivot.columns)))
+        axes[axes_index].set_xticklabels(
+            [str(value) for value in pivot.columns],
+            rotation=45,
+            ha="right",
+        )
+        axes[axes_index].set_yticks(np.arange(len(pivot.index)))
+        axes[axes_index].set_yticklabels([str(value) for value in pivot.index])
+        figure.colorbar(image, ax=axes[axes_index], fraction=0.046, pad=0.04)
+
+    figure.suptitle(f"Interaction Diagnostics: {feature_1} × {feature_2}")
     figure.tight_layout()
     return figure
 

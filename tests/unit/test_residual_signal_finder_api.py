@@ -380,6 +380,29 @@ def test_offbalance_levels_predictions_to_target_across_cv_splits() -> None:
     assert actual_mean == pytest.approx(predicted_mean)
 
 
+def test_offbalance_levels_displayed_predictions_with_sample_weight() -> None:
+    X, y_true, y_pred, sample_weight, _split_col = make_binary_residual_signal_data()
+    finder = ResidualSignalFinder(
+        model_type="xgboost",
+        n_estimators=25,
+        n_splits=3,
+        offbalance=True,
+        random_state=42,
+    )
+
+    with pytest.warns(UserWarning, match="Binary classification target detected"):
+        result = finder.fit(X=X, y_true=y_true, y_pred=y_pred, sample_weight=sample_weight)
+
+    diagnostics = result.binned_diagnostics["residual_signal"]
+    row_count = diagnostics["n_obs"].sum()
+    actual_mean = float((diagnostics["actual_mean"] * diagnostics["n_obs"]).sum() / row_count)
+    predicted_mean = float(
+        (diagnostics["predicted_mean"] * diagnostics["n_obs"]).sum() / row_count
+    )
+
+    assert actual_mean == pytest.approx(predicted_mean)
+
+
 def test_categorical_columns_are_rejected_with_clear_error_for_v1() -> None:
     data = make_synthetic_residual_data()
     X = data.X.copy()

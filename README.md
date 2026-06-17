@@ -28,3 +28,6 @@ automatically treats the task as classification, models the target again with
 the original prediction included as a control, and emits a warning describing
 that behavior. Set `offbalance=True` to level held-out predictions to the target
 mean within each split before scoring and binned diagnostics.
+
+When SHAP interaction values are available, `plot_top_interactions()` creates
+saved heatmap figures for the strongest feature pairs.
