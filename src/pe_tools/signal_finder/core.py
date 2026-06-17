@@ -10,6 +10,7 @@ from typing import Any, Literal, TypeAlias
 
 import numpy as np
 import pandas as pd
+from matplotlib.figure import Figure
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import r2_score
@@ -127,6 +128,40 @@ class ResidualSignalFinderResult:
             raise ValueError(f"Could not write HTML report to {output_path}: {error}") from error
 
         return output_path
+
+    def plot_top_residual_signals(
+        self,
+        top_n: int = 10,
+        save_dir: str | Path | None = None,
+    ) -> dict[str, Figure]:
+        """Plot binned actual, predicted, and residual diagnostics for top features."""
+        if top_n < 1:
+            raise ValueError("top_n must be at least 1")
+
+        output_dir = _validate_plot_dir(save_dir) if save_dir is not None else None
+        figures: dict[str, Figure] = {}
+        for feature in _top_feature_names(self, top_n=top_n):
+            diagnostics = self.binned_diagnostics.get(feature)
+            if diagnostics is None or diagnostics.empty:
+                continue
+
+            figure = _plot_binned_diagnostics(feature, diagnostics)
+            figures[feature] = figure
+            if output_dir is not None:
+                figure.savefig(
+                    output_dir / f"{_safe_filename_stem(feature)}.png",
+                    bbox_inches="tight",
+                )
+
+        return figures
+
+    def plot_top_signals(
+        self,
+        top_n: int = 10,
+        save_dir: str | Path | None = None,
+    ) -> dict[str, Figure]:
+        """Alias for plot_top_residual_signals."""
+        return self.plot_top_residual_signals(top_n=top_n, save_dir=save_dir)
 
 
 @dataclass
@@ -724,6 +759,15 @@ def _validate_report_path(path: str | Path) -> Path:
     return output_path
 
 
+def _validate_plot_dir(path: str | Path) -> Path:
+    output_dir = Path(path)
+    if not output_dir.exists():
+        raise ValueError(f"Plot output directory does not exist: {output_dir}")
+    if not output_dir.is_dir():
+        raise ValueError(f"Plot output path must be a directory: {output_dir}")
+    return output_dir
+
+
 def _sanitize_excel_sheet_name(sheet_name: str, used_names: set[str]) -> str:
     cleaned = re.sub(r"[\[\]\:\*\?\/\\]", "_", str(sheet_name)).strip().strip("'")
     cleaned = re.sub(r"\s+", " ", cleaned) or "sheet"
@@ -736,6 +780,11 @@ def _sanitize_excel_sheet_name(sheet_name: str, used_names: set[str]) -> str:
         counter += 1
     used_names.add(candidate.lower())
     return candidate
+
+
+def _safe_filename_stem(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("._")
+    return (cleaned or "feature")[:80]
 
 
 def _safe_table_for_export(frame: pd.DataFrame) -> pd.DataFrame:
@@ -792,6 +841,46 @@ def _format_report_value(value: Any) -> str:
 
 def _html_table(frame: pd.DataFrame) -> str:
     return _safe_table_for_export(frame).to_html(index=False, escape=True)
+
+
+def _plot_binned_diagnostics(feature: str, diagnostics: pd.DataFrame) -> Figure:
+    required_columns = {"residual_mean", "predicted_residual_mean", "prediction_error_mean"}
+    missing_columns = sorted(required_columns - set(diagnostics.columns))
+    if missing_columns:
+        raise ValueError(f"binned diagnostics missing columns: {missing_columns}")
+
+    figure = Figure(figsize=(8, 4.5))
+    axes = figure.subplots()
+    x_values = np.arange(len(diagnostics))
+    x_labels = (
+        diagnostics["bin"].astype(str).tolist()
+        if "bin" in diagnostics.columns
+        else [str(value) for value in x_values]
+    )
+    series_specs = [
+        ("residual_mean", "Mean actual"),
+        ("predicted_residual_mean", "Mean predicted"),
+        ("prediction_error_mean", "Mean residual"),
+    ]
+    for column, label in series_specs:
+        axes.plot(
+            x_values,
+            pd.to_numeric(diagnostics[column]),
+            marker="o",
+            linewidth=1.6,
+            label=label,
+        )
+
+    axes.axhline(0.0, color="black", linewidth=0.8, alpha=0.5)
+    axes.set_title(f"Residual Signal Diagnostics: {feature}")
+    axes.set_xlabel("Feature bin")
+    axes.set_ylabel("Mean value")
+    axes.set_xticks(x_values)
+    axes.set_xticklabels(x_labels, rotation=45, ha="right")
+    axes.legend()
+    axes.grid(True, alpha=0.25)
+    figure.tight_layout()
+    return figure
 
 
 def residualize(values: pd.Series, controls: pd.DataFrame) -> pd.Series:
