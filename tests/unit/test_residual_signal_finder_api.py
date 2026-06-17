@@ -77,9 +77,11 @@ def test_feature_stability_has_expected_columns() -> None:
         "feature",
         "mean_importance",
         "std_importance",
-        "cv_importance",
-        "selection_rate",
         "mean_rank",
+        "rank_std",
+        "top_1_rate",
+        "top_3_rate",
+        "selected_rate",
     }
 
 
