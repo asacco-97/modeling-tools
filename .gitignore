@@ -46,6 +46,12 @@ models/
 # Virtual Environments and Packages
 # ==========================================
 # Exclude your local dependencies to keep the repository light
+.coverage
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
 .venv/
 env/
 venv/

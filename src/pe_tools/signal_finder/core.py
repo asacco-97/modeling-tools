@@ -2,10 +2,14 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LinearRegression
+
+ModelType = Literal["xgboost", "random_forest"]
+SplitStrategy = Literal["cv", "holdout", "group_cv", "bootstrap"]
 
 
 @dataclass(frozen=True)
@@ -16,6 +20,50 @@ class ResidualSignalResult:
     signal_residual: pd.Series
     correlation: float
     n_obs: int
+
+
+@dataclass(frozen=True)
+class ResidualSignalFinderResult:
+    """Result returned by ResidualSignalFinder.fit."""
+
+    residuals: pd.Series
+    feature_importance: pd.DataFrame
+    feature_stability: pd.DataFrame
+    binned_diagnostics: dict[str, pd.DataFrame]
+    residual_model_score: dict[str, float]
+    fold_scores: pd.DataFrame
+    fold_feature_importance: pd.DataFrame
+    metadata: dict[str, Any]
+    models: list[Any]
+
+
+@dataclass
+class ResidualSignalFinder:
+    """Public API skeleton for residual signal discovery."""
+
+    model_type: ModelType = "xgboost"
+    max_depth: int = 1
+    n_estimators: int = 100
+    learning_rate: float = 0.05
+    n_bins: int = 10
+    split_strategy: SplitStrategy = "cv"
+    n_splits: int = 5
+    n_repeats: int = 1
+    stratify_col: str | None = None
+    group_col: str | None = None
+    random_state: int | None = None
+    model_params: dict[str, Any] | None = None
+
+    def fit(
+        self,
+        *,
+        X: pd.DataFrame,
+        y_true: pd.Series,
+        y_pred: pd.Series,
+        sample_weight: pd.Series | np.ndarray | None = None,
+        split_col: pd.Series | None = None,
+    ) -> ResidualSignalFinderResult:
+        raise NotImplementedError("ResidualSignalFinder.fit is not implemented yet.")
 
 
 def residualize(values: pd.Series, controls: pd.DataFrame) -> pd.Series:
@@ -79,4 +127,3 @@ def find_residual_signal(
         correlation=correlation,
         n_obs=len(residual_frame),
     )
-
