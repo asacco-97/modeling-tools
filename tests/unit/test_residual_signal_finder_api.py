@@ -1,8 +1,45 @@
+import numpy as np
 import pandas as pd
 import pytest
 from tests.fixtures.synthetic_signal import make_synthetic_residual_data
 
 from pe_tools.signal_finder import ResidualSignalFinder, ResidualSignalFinderResult
+
+
+def make_binary_residual_signal_data(
+    row_count: int = 300,
+) -> tuple[pd.DataFrame, pd.Series, pd.Series, pd.Series, pd.Series]:
+    rng = np.random.default_rng(42)
+    baseline_score = rng.normal(size=row_count)
+    residual_signal = rng.normal(size=row_count)
+    weak_signal = rng.normal(size=row_count)
+    noise = rng.normal(size=row_count)
+    y_pred = 1.0 / (1.0 + np.exp(-baseline_score))
+    probability = 1.0 / (1.0 + np.exp(-(baseline_score + 2.0 * residual_signal)))
+    y_true = rng.binomial(1, probability, size=row_count)
+
+    X = pd.DataFrame(
+        {
+            "residual_signal": residual_signal,
+            "weak_signal": weak_signal,
+            "noise": noise,
+        }
+    )
+    split_col = pd.Series(
+        np.select(
+            [np.arange(row_count) < 200, np.arange(row_count) < 250],
+            ["train", "validation"],
+            default="holdout",
+        ),
+        name="split",
+    )
+    return (
+        X,
+        pd.Series(y_true, name="y_true"),
+        pd.Series(y_pred, name="y_pred"),
+        pd.Series(1.0 + rng.random(row_count), name="sample_weight"),
+        split_col,
+    )
 
 
 def test_residuals_equal_y_true_minus_y_pred() -> None:
@@ -340,3 +377,67 @@ def test_missing_values_are_rejected_with_clear_error_for_v1() -> None:
 
     with pytest.raises(ValueError, match="missing.*not supported.*v1"):
         finder.fit(X=X, y_true=data.y_true, y_pred=data.y_pred)
+
+
+def test_binary_target_models_target_with_prediction_control() -> None:
+    X, y_true, y_pred, sample_weight, _split_col = make_binary_residual_signal_data()
+    finder = ResidualSignalFinder(
+        model_type="xgboost",
+        n_estimators=25,
+        n_splits=3,
+        random_state=42,
+    )
+
+    with pytest.warns(UserWarning, match="Binary classification target detected"):
+        result = finder.fit(X=X, y_true=y_true, y_pred=y_pred, sample_weight=sample_weight)
+
+    expected_residuals = y_true - y_pred
+    pd.testing.assert_series_equal(result.residuals, expected_residuals, check_names=False)
+    assert result.metadata["task_type"] == "binary_classification"
+    assert result.metadata["model_target"] == "y_true"
+    control_column = result.metadata["prediction_control_column"]
+    assert control_column
+    assert control_column not in set(result.feature_importance["feature"])
+    assert control_column in result.models[0].get_booster().feature_names
+
+
+def test_binary_target_importance_and_diagnostics_focus_on_public_features() -> None:
+    X, y_true, y_pred, _sample_weight, _split_col = make_binary_residual_signal_data()
+    finder = ResidualSignalFinder(
+        model_type="xgboost",
+        n_estimators=40,
+        n_splits=3,
+        random_state=42,
+    )
+
+    with pytest.warns(UserWarning, match="Binary classification target detected"):
+        result = finder.fit(X=X, y_true=y_true, y_pred=y_pred)
+
+    assert result.feature_importance.iloc[0]["feature"] == "residual_signal"
+    assert set(result.binned_diagnostics) == set(X.columns)
+    diagnostics = result.binned_diagnostics["residual_signal"]
+    assert {"actual_mean", "predicted_mean", "error_mean"}.issubset(diagnostics.columns)
+    assert diagnostics["actual_mean"].between(0.0, 1.0).all()
+
+
+def test_binary_target_holdout_uses_classification_behavior() -> None:
+    X, y_true, y_pred, sample_weight, split_col = make_binary_residual_signal_data()
+    finder = ResidualSignalFinder(
+        model_type="xgboost",
+        n_estimators=25,
+        split_strategy="holdout",
+        random_state=42,
+    )
+
+    with pytest.warns(UserWarning, match="Binary classification target detected"):
+        result = finder.fit(
+            X=X,
+            y_true=y_true,
+            y_pred=y_pred,
+            sample_weight=sample_weight,
+            split_col=split_col,
+        )
+
+    assert result.metadata["task_type"] == "binary_classification"
+    assert result.fold_scores["split"].tolist() == ["validation", "holdout"]
+    assert result.binned_diagnostics["residual_signal"]["actual_mean"].between(0.0, 1.0).all()

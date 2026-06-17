@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import json
 import re
+import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,6 +23,12 @@ SplitStrategy = Literal["cv", "holdout", "group_cv", "bootstrap"]
 VALID_MODEL_TYPES = {"xgboost", "random_forest"}
 VALID_SPLIT_STRATEGIES = {"cv", "holdout", "group_cv", "bootstrap"}
 INTERACTION_IMPORTANCE_COLUMNS = ["feature_1", "feature_2", "importance", "rank"]
+PREDICTION_CONTROL_BASE = "__y_pred_control__"
+CLASSIFICATION_BEHAVIOR_MESSAGE = (
+    "Binary classification target detected; ResidualSignalFinder will model y_true directly "
+    "with y_pred included as a control feature because y_true - y_pred residuals are less "
+    "informative for classification."
+)
 SeriesLike: TypeAlias = pd.Series | np.ndarray[Any, Any] | Sequence[float]
 LabelLike: TypeAlias = pd.Series | np.ndarray[Any, Any] | Sequence[Any]
 
@@ -100,6 +107,14 @@ class ResidualSignalFinderResult:
 
         fold_distribution = self.fold_scores.describe(include="all").reset_index()
         fold_distribution = fold_distribution.rename(columns={"index": "metric"})
+        warning_items = [str(value) for value in self.metadata.get("warnings", [])]
+        warning_content = (
+            "<ul>"
+            + "".join(f"<li>{html.escape(warning)}</li>" for warning in warning_items)
+            + "</ul>"
+            if warning_items
+            else "<p>No runtime warnings were emitted.</p>"
+        )
         content = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -125,8 +140,9 @@ class ResidualSignalFinderResult:
   <h2>Top Feature Binned Diagnostics</h2>
   {''.join(diagnostics_sections)}
   <h2>Warnings / Limitations</h2>
-  <p>This minimal v1 report does not include SHAP, plotting, Excel styling,
-  interaction logic, categorical feature handling, or missing-value handling.</p>
+  {warning_content}
+  <p>Limitations: this v1 implementation requires numeric features and rejects
+  missing values.</p>
 </body>
 </html>
 """
@@ -170,6 +186,19 @@ class ResidualSignalFinderResult:
     ) -> dict[str, Figure]:
         """Alias for plot_top_residual_signals."""
         return self.plot_top_residual_signals(top_n=top_n, save_dir=save_dir)
+
+
+@dataclass(frozen=True)
+class _ModelingContext:
+    residuals: pd.Series
+    model_target: pd.Series
+    model_X: pd.DataFrame
+    diagnostic_X: pd.DataFrame
+    public_feature_names: list[str]
+    task_type: str
+    model_target_name: str
+    prediction_control_column: str | None
+    warnings: list[str]
 
 
 @dataclass
@@ -229,46 +258,49 @@ class ResidualSignalFinder:
             sample_weight=sample_weight,
             split_col=split_col,
         )
-        residuals = pd.Series(y_true_valid - y_pred_valid, index=X_valid.index, name="residual")
         split_series = (
             _coerce_series(split_col, name="split_col", index=X_valid.index)
             if split_col is not None
             else None
+        )
+        base_model_X, groups = self._model_frame_and_groups(X_valid)
+        context = _make_modeling_context(
+            X=base_model_X,
+            y_true=y_true_valid,
+            y_pred=y_pred_valid,
         )
 
         if self.split_strategy == "holdout":
             if split_series is None:
                 raise ValueError("split_col is required when split_strategy='holdout'")
             return self._fit_holdout(
-                X=X_valid,
-                residuals=residuals,
+                context=context,
                 sample_weight=weight_values,
                 split_col=split_series,
                 sample_weight_used=sample_weight is not None,
             )
 
-        model_X, groups = self._model_frame_and_groups(X_valid)
         if self.split_strategy == "bootstrap":
             return self._fit_bootstrap(
-                X=model_X,
-                residuals=residuals,
+                context=context,
                 sample_weight=weight_values,
                 sample_weight_used=sample_weight is not None,
             )
 
-        feature_names = list(model_X.columns)
+        model_X = context.model_X
+        model_feature_names = list(model_X.columns)
         fold_scores: list[dict[str, Any]] = []
         fold_importance_frames: list[pd.DataFrame] = []
         fold_interaction_frames: list[pd.DataFrame] = []
         models: list[Any] = []
-        oof_predictions = pd.Series(np.nan, index=X_valid.index, name="predicted_residual")
+        oof_predictions = pd.Series(np.nan, index=X_valid.index, name="predicted_model_target")
         shap_module, interaction_warnings = _load_shap_for_interactions(self.max_depth)
 
         for fold, (train_idx, test_idx) in enumerate(self._cv_splits(model_X, groups)):
             X_train = model_X.iloc[train_idx]
             X_test = model_X.iloc[test_idx]
-            y_train = residuals.iloc[train_idx]
-            y_test = residuals.iloc[test_idx]
+            y_train = context.model_target.iloc[train_idx]
+            y_test = context.model_target.iloc[test_idx]
             train_weight = weight_values[train_idx] if weight_values is not None else None
             test_weight = weight_values[test_idx] if weight_values is not None else None
 
@@ -294,39 +326,58 @@ class ResidualSignalFinder:
                     ),
                 }
             )
-            fold_importance_frames.append(self._feature_importance(model, feature_names, fold))
+            fold_importance_frames.append(
+                self._feature_importance(model, model_feature_names, fold)
+            )
             interaction_frame = _fold_interaction_importance(
                 shap_module=shap_module,
                 model=model,
                 X_eval=X_test,
-                feature_names=feature_names,
+                feature_names=model_feature_names,
                 fold=fold,
                 random_state=self.random_state,
+            )
+            interaction_frame = _filter_public_interactions(
+                interaction_frame,
+                context.public_feature_names,
             )
             if not interaction_frame.empty:
                 fold_interaction_frames.append(interaction_frame)
             models.append(model)
 
         fold_scores_frame = pd.DataFrame(fold_scores)
-        fold_feature_importance = pd.concat(fold_importance_frames, ignore_index=True)
+        fold_feature_importance = _filter_public_feature_importance(
+            pd.concat(fold_importance_frames, ignore_index=True),
+            context.public_feature_names,
+        )
         feature_importance = self._aggregate_feature_importance(fold_feature_importance)
         feature_stability = self._feature_stability(fold_feature_importance)
         interaction_importance = _aggregate_interaction_importance(fold_interaction_frames)
-        binned_diagnostics = self._binned_diagnostics(model_X, residuals, oof_predictions)
+        binned_diagnostics = self._binned_diagnostics(
+            context.diagnostic_X,
+            context.model_target,
+            oof_predictions,
+        )
         residual_model_score = {
             "mean_train_r2": float(fold_scores_frame["train_r2"].mean()),
             "mean_test_r2": float(fold_scores_frame["test_r2"].mean()),
             "std_test_r2": float(fold_scores_frame["test_r2"].std(ddof=0)),
         }
         return ResidualSignalFinderResult(
-            residuals=residuals,
+            residuals=context.residuals,
             feature_importance=feature_importance,
             feature_stability=feature_stability,
             binned_diagnostics=binned_diagnostics,
             residual_model_score=residual_model_score,
             fold_scores=fold_scores_frame,
             fold_feature_importance=fold_feature_importance,
-            metadata=self._metadata(sample_weight is not None, warnings=interaction_warnings),
+            metadata=self._metadata(
+                sample_weight is not None,
+                task_type=context.task_type,
+                model_target=context.model_target_name,
+                prediction_control_column=context.prediction_control_column,
+                warnings=[*context.warnings, *interaction_warnings],
+            ),
             models=models,
             interaction_importance=interaction_importance,
         )
@@ -334,8 +385,7 @@ class ResidualSignalFinder:
     def _fit_holdout(
         self,
         *,
-        X: pd.DataFrame,
-        residuals: pd.Series,
+        context: _ModelingContext,
         sample_weight: np.ndarray[Any, Any] | None,
         split_col: pd.Series,
         sample_weight_used: bool,
@@ -358,19 +408,20 @@ class ResidualSignalFinder:
         if not score_labels:
             raise ValueError("split_col must contain validation or holdout labels")
 
-        feature_names = list(X.columns)
+        X = context.model_X
+        model_feature_names = list(X.columns)
         train_idx = np.flatnonzero(train_mask.to_numpy())
         train_weight = sample_weight[train_idx] if sample_weight is not None else None
         model = self._make_model()
         fit_kwargs = {"sample_weight": train_weight} if train_weight is not None else {}
-        model.fit(X.iloc[train_idx], residuals.iloc[train_idx], **fit_kwargs)
+        model.fit(X.iloc[train_idx], context.model_target.iloc[train_idx], **fit_kwargs)
         train_pred = model.predict(X.iloc[train_idx])
         train_r2 = float(
-            r2_score(residuals.iloc[train_idx], train_pred, sample_weight=train_weight)
+            r2_score(context.model_target.iloc[train_idx], train_pred, sample_weight=train_weight)
         )
 
         fold_scores: list[dict[str, Any]] = []
-        predictions = pd.Series(np.nan, index=X.index, name="predicted_residual")
+        predictions = pd.Series(np.nan, index=X.index, name="predicted_model_target")
         for fold, label in enumerate(score_labels):
             test_mask = split_labels == label
             test_idx = np.flatnonzero(test_mask.to_numpy())
@@ -378,7 +429,7 @@ class ResidualSignalFinder:
             test_pred = model.predict(X.iloc[test_idx])
             predictions.iloc[test_idx] = test_pred
             test_r2 = float(
-                r2_score(residuals.iloc[test_idx], test_pred, sample_weight=test_weight)
+                r2_score(context.model_target.iloc[test_idx], test_pred, sample_weight=test_weight)
             )
             fold_scores.append(
                 {
@@ -393,26 +444,28 @@ class ResidualSignalFinder:
             )
 
         fold_scores_frame = pd.DataFrame(fold_scores)
-        fold_feature_importance = self._feature_importance(model, feature_names, 0)
+        fold_feature_importance = _filter_public_feature_importance(
+            self._feature_importance(model, model_feature_names, 0),
+            context.public_feature_names,
+        )
         feature_importance = self._aggregate_feature_importance(fold_feature_importance)
         feature_stability = self._feature_stability(fold_feature_importance)
         shap_module, interaction_warnings = _load_shap_for_interactions(self.max_depth)
+        interaction_frame = _fold_interaction_importance(
+            shap_module=shap_module,
+            model=model,
+            X_eval=X.loc[split_labels.isin(["validation", "holdout"])],
+            feature_names=model_feature_names,
+            fold=0,
+            random_state=self.random_state,
+        )
         interaction_importance = _aggregate_interaction_importance(
-            [
-                _fold_interaction_importance(
-                    shap_module=shap_module,
-                    model=model,
-                    X_eval=X.loc[split_labels.isin(["validation", "holdout"])],
-                    feature_names=feature_names,
-                    fold=0,
-                    random_state=self.random_state,
-                )
-            ]
+            [_filter_public_interactions(interaction_frame, context.public_feature_names)]
         )
         eval_mask = split_labels.isin(["validation", "holdout"])
         binned_diagnostics = self._binned_diagnostics(
-            X.loc[eval_mask],
-            residuals.loc[eval_mask],
+            context.diagnostic_X.loc[eval_mask],
+            context.model_target.loc[eval_mask],
             predictions.loc[eval_mask],
         )
         residual_model_score = {
@@ -424,14 +477,20 @@ class ResidualSignalFinder:
             residual_model_score[f"{row['split']}_r2"] = float(row["test_r2"])
 
         return ResidualSignalFinderResult(
-            residuals=residuals,
+            residuals=context.residuals,
             feature_importance=feature_importance,
             feature_stability=feature_stability,
             binned_diagnostics=binned_diagnostics,
             residual_model_score=residual_model_score,
             fold_scores=fold_scores_frame,
             fold_feature_importance=fold_feature_importance,
-            metadata=self._metadata(sample_weight_used, warnings=interaction_warnings),
+            metadata=self._metadata(
+                sample_weight_used,
+                task_type=context.task_type,
+                model_target=context.model_target_name,
+                prediction_control_column=context.prediction_control_column,
+                warnings=[*context.warnings, *interaction_warnings],
+            ),
             models=[model],
             interaction_importance=interaction_importance,
         )
@@ -439,20 +498,20 @@ class ResidualSignalFinder:
     def _fit_bootstrap(
         self,
         *,
-        X: pd.DataFrame,
-        residuals: pd.Series,
+        context: _ModelingContext,
         sample_weight: np.ndarray[Any, Any] | None,
         sample_weight_used: bool,
     ) -> ResidualSignalFinderResult:
         rng = np.random.default_rng(self.random_state)
+        X = context.model_X
         row_count = len(X)
         train_size = max(1, int(round(row_count * self.sample_fraction)))
-        feature_names = list(X.columns)
+        model_feature_names = list(X.columns)
         fold_scores: list[dict[str, Any]] = []
         fold_importance_frames: list[pd.DataFrame] = []
         fold_interaction_frames: list[pd.DataFrame] = []
         models: list[Any] = []
-        prediction_sum = pd.Series(0.0, index=X.index, name="predicted_residual")
+        prediction_sum = pd.Series(0.0, index=X.index, name="predicted_model_target")
         prediction_count = pd.Series(0, index=X.index, name="prediction_count")
         shap_module, interaction_warnings = _load_shap_for_interactions(self.max_depth)
 
@@ -468,15 +527,23 @@ class ResidualSignalFinder:
             test_weight = sample_weight[test_idx] if sample_weight is not None else None
             model = self._make_model()
             fit_kwargs = {"sample_weight": train_weight} if train_weight is not None else {}
-            model.fit(X.iloc[train_idx], residuals.iloc[train_idx], **fit_kwargs)
+            model.fit(X.iloc[train_idx], context.model_target.iloc[train_idx], **fit_kwargs)
             train_pred = model.predict(X.iloc[train_idx])
             test_pred = model.predict(X.iloc[test_idx])
 
             train_r2 = float(
-                r2_score(residuals.iloc[train_idx], train_pred, sample_weight=train_weight)
+                r2_score(
+                    context.model_target.iloc[train_idx],
+                    train_pred,
+                    sample_weight=train_weight,
+                )
             )
             test_r2 = float(
-                r2_score(residuals.iloc[test_idx], test_pred, sample_weight=test_weight)
+                r2_score(
+                    context.model_target.iloc[test_idx],
+                    test_pred,
+                    sample_weight=test_weight,
+                )
             )
             fold_scores.append(
                 {
@@ -489,14 +556,20 @@ class ResidualSignalFinder:
                     "test_size": len(test_idx),
                 }
             )
-            fold_importance_frames.append(self._feature_importance(model, feature_names, repeat))
+            fold_importance_frames.append(
+                self._feature_importance(model, model_feature_names, repeat)
+            )
             interaction_frame = _fold_interaction_importance(
                 shap_module=shap_module,
                 model=model,
                 X_eval=X.iloc[test_idx],
-                feature_names=feature_names,
+                feature_names=model_feature_names,
                 fold=repeat,
                 random_state=self.random_state,
+            )
+            interaction_frame = _filter_public_interactions(
+                interaction_frame,
+                context.public_feature_names,
             )
             if not interaction_frame.empty:
                 fold_interaction_frames.append(interaction_frame)
@@ -508,12 +581,19 @@ class ResidualSignalFinder:
             raise ValueError("No bootstrap repeats produced out-of-bag rows")
 
         fold_scores_frame = pd.DataFrame(fold_scores)
-        fold_feature_importance = pd.concat(fold_importance_frames, ignore_index=True)
+        fold_feature_importance = _filter_public_feature_importance(
+            pd.concat(fold_importance_frames, ignore_index=True),
+            context.public_feature_names,
+        )
         feature_importance = self._aggregate_feature_importance(fold_feature_importance)
         feature_stability = self._feature_stability(fold_feature_importance)
         interaction_importance = _aggregate_interaction_importance(fold_interaction_frames)
         predictions = prediction_sum / prediction_count.replace(0, np.nan)
-        binned_diagnostics = self._binned_diagnostics(X, residuals, predictions)
+        binned_diagnostics = self._binned_diagnostics(
+            context.diagnostic_X,
+            context.model_target,
+            predictions,
+        )
         residual_model_score = {
             "mean_train_r2": float(fold_scores_frame["train_r2"].mean()),
             "mean_test_r2": float(fold_scores_frame["test_r2"].mean()),
@@ -521,14 +601,20 @@ class ResidualSignalFinder:
         }
 
         return ResidualSignalFinderResult(
-            residuals=residuals,
+            residuals=context.residuals,
             feature_importance=feature_importance,
             feature_stability=feature_stability,
             binned_diagnostics=binned_diagnostics,
             residual_model_score=residual_model_score,
             fold_scores=fold_scores_frame,
             fold_feature_importance=fold_feature_importance,
-            metadata=self._metadata(sample_weight_used, warnings=interaction_warnings),
+            metadata=self._metadata(
+                sample_weight_used,
+                task_type=context.task_type,
+                model_target=context.model_target_name,
+                prediction_control_column=context.prediction_control_column,
+                warnings=[*context.warnings, *interaction_warnings],
+            ),
             models=models,
             interaction_importance=interaction_importance,
         )
@@ -536,6 +622,10 @@ class ResidualSignalFinder:
     def _metadata(
         self,
         sample_weight_used: bool,
+        *,
+        task_type: str,
+        model_target: str,
+        prediction_control_column: str | None,
         warnings: Sequence[str] = (),
     ) -> dict[str, Any]:
         return {
@@ -552,6 +642,10 @@ class ResidualSignalFinder:
             "group_col": self.group_col,
             "random_state": self.random_state,
             "sample_weight_used": sample_weight_used,
+            "task_type": task_type,
+            "model_target": model_target,
+            "residuals_definition": "y_true - y_pred",
+            "prediction_control_column": prediction_control_column,
             "warnings": list(warnings),
         }
 
@@ -717,7 +811,7 @@ class ResidualSignalFinder:
     def _binned_diagnostics(
         self,
         X: pd.DataFrame,
-        residuals: pd.Series,
+        observed: pd.Series,
         predictions: pd.Series,
     ) -> dict[str, pd.DataFrame]:
         diagnostics = {}
@@ -725,25 +819,119 @@ class ResidualSignalFinder:
             source = pd.DataFrame(
                 {
                     "feature_value": X[feature],
-                    "residual": residuals,
-                    "predicted_residual": predictions,
+                    "actual": observed,
+                    "predicted": predictions,
                 }
             ).dropna()
-            source["prediction_error"] = source["residual"] - source["predicted_residual"]
+            source["prediction_error"] = source["actual"] - source["predicted"]
             bin_count = min(self.n_bins, source["feature_value"].nunique())
             source["bin"] = pd.qcut(source["feature_value"], q=bin_count, duplicates="drop")
-            diagnostics[str(feature)] = (
+            feature_diagnostics = (
                 source.groupby("bin", observed=True)
                 .agg(
-                    n_obs=("residual", "size"),
+                    n_obs=("actual", "size"),
                     feature_mean=("feature_value", "mean"),
-                    residual_mean=("residual", "mean"),
-                    predicted_residual_mean=("predicted_residual", "mean"),
+                    actual_mean=("actual", "mean"),
+                    predicted_mean=("predicted", "mean"),
+                    error_mean=("prediction_error", "mean"),
+                    residual_mean=("actual", "mean"),
+                    predicted_residual_mean=("predicted", "mean"),
                     prediction_error_mean=("prediction_error", "mean"),
                 )
                 .reset_index()
             )
+            diagnostics[str(feature)] = feature_diagnostics
         return diagnostics
+
+
+def _make_modeling_context(
+    *,
+    X: pd.DataFrame,
+    y_true: pd.Series,
+    y_pred: pd.Series,
+) -> _ModelingContext:
+    residuals = pd.Series(y_true - y_pred, index=X.index, name="residual")
+    public_feature_names = [str(column) for column in X.columns]
+    if not _is_binary_classification_target(y_true):
+        return _ModelingContext(
+            residuals=residuals,
+            model_target=residuals,
+            model_X=X,
+            diagnostic_X=X,
+            public_feature_names=public_feature_names,
+            task_type="regression",
+            model_target_name="residual",
+            prediction_control_column=None,
+            warnings=[],
+        )
+
+    warnings.warn(CLASSIFICATION_BEHAVIOR_MESSAGE, UserWarning, stacklevel=3)
+    model_X, control_column = _add_prediction_control(X, y_pred)
+    return _ModelingContext(
+        residuals=residuals,
+        model_target=y_true.rename("target"),
+        model_X=model_X,
+        diagnostic_X=X,
+        public_feature_names=public_feature_names,
+        task_type="binary_classification",
+        model_target_name="y_true",
+        prediction_control_column=control_column,
+        warnings=[CLASSIFICATION_BEHAVIOR_MESSAGE],
+    )
+
+
+def _is_binary_classification_target(values: pd.Series) -> bool:
+    unique_values = set(pd.to_numeric(values).dropna().unique().tolist())
+    return bool(unique_values) and unique_values.issubset({0.0, 1.0})
+
+
+def _add_prediction_control(X: pd.DataFrame, y_pred: pd.Series) -> tuple[pd.DataFrame, str]:
+    control_column = _unused_column_name(X.columns, PREDICTION_CONTROL_BASE)
+    model_X = X.copy()
+    model_X[control_column] = y_pred.to_numpy()
+    return model_X, control_column
+
+
+def _unused_column_name(columns: pd.Index, base_name: str) -> str:
+    existing = {str(column) for column in columns}
+    if base_name not in existing:
+        return base_name
+    counter = 1
+    while f"{base_name}_{counter}" in existing:
+        counter += 1
+    return f"{base_name}_{counter}"
+
+
+def _filter_public_feature_importance(
+    fold_feature_importance: pd.DataFrame,
+    public_feature_names: list[str],
+) -> pd.DataFrame:
+    public_features = set(public_feature_names)
+    filtered = fold_feature_importance[
+        fold_feature_importance["feature"].astype(str).isin(public_features)
+    ].copy()
+    if filtered.empty:
+        return filtered
+    filtered = filtered.sort_values(
+        ["fold", "importance", "feature"],
+        ascending=[True, False, True],
+        ignore_index=True,
+    )
+    filtered["rank"] = filtered.groupby("fold").cumcount() + 1
+    return filtered
+
+
+def _filter_public_interactions(
+    interactions: pd.DataFrame,
+    public_feature_names: list[str],
+) -> pd.DataFrame:
+    if interactions.empty:
+        return interactions
+    public_features = set(public_feature_names)
+    mask = interactions["feature_1"].isin(public_features) & interactions["feature_2"].isin(
+        public_features
+    )
+    return interactions.loc[mask].copy()
 
 
 def _coerce_series(values: LabelLike, *, name: str, index: pd.Index) -> pd.Series:
@@ -944,6 +1132,8 @@ def _summary_frame(result: ResidualSignalFinderResult) -> pd.DataFrame:
         "n_features": len(result.feature_importance),
         "n_folds": len(result.fold_scores),
         "n_models": len(result.models),
+        "task_type": result.metadata.get("task_type", "regression"),
+        "model_target": result.metadata.get("model_target", "residual"),
         **{f"score_{key}": value for key, value in result.residual_model_score.items()},
     }
     return _dict_frame(summary)
@@ -972,7 +1162,19 @@ def _html_table(frame: pd.DataFrame) -> str:
 
 
 def _plot_binned_diagnostics(feature: str, diagnostics: pd.DataFrame) -> Figure:
-    required_columns = {"residual_mean", "predicted_residual_mean", "prediction_error_mean"}
+    if {"actual_mean", "predicted_mean", "error_mean"}.issubset(diagnostics.columns):
+        series_specs = [
+            ("actual_mean", "Mean actual"),
+            ("predicted_mean", "Mean predicted"),
+            ("error_mean", "Mean error"),
+        ]
+    else:
+        series_specs = [
+            ("residual_mean", "Mean actual"),
+            ("predicted_residual_mean", "Mean predicted"),
+            ("prediction_error_mean", "Mean residual"),
+        ]
+    required_columns = {column for column, _label in series_specs}
     missing_columns = sorted(required_columns - set(diagnostics.columns))
     if missing_columns:
         raise ValueError(f"binned diagnostics missing columns: {missing_columns}")
@@ -985,11 +1187,6 @@ def _plot_binned_diagnostics(feature: str, diagnostics: pd.DataFrame) -> Figure:
         if "bin" in diagnostics.columns
         else [str(value) for value in x_values]
     )
-    series_specs = [
-        ("residual_mean", "Mean actual"),
-        ("predicted_residual_mean", "Mean predicted"),
-        ("prediction_error_mean", "Mean residual"),
-    ]
     for column, label in series_specs:
         axes.plot(
             x_values,
