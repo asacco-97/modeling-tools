@@ -140,12 +140,160 @@ def test_holdout_requires_split_col() -> None:
         finder.fit(X=data.X, y_true=data.y_true, y_pred=data.y_pred)
 
 
+def test_holdout_works_with_train_validation_holdout_labels() -> None:
+    data = make_synthetic_residual_data()
+    finder = ResidualSignalFinder(split_strategy="holdout", random_state=42)
+
+    result = finder.fit(
+        X=data.X,
+        y_true=data.y_true,
+        y_pred=data.y_pred,
+        split_col=data.split_col,
+    )
+
+    assert result.metadata["split_strategy"] == "holdout"
+    assert result.fold_scores["split"].tolist() == ["validation", "holdout"]
+    assert len(result.models) == 1
+    assert not result.feature_importance.empty
+    assert result.binned_diagnostics["residual_signal"]["n_obs"].sum() == 40
+
+
+def test_holdout_works_with_train_holdout_only() -> None:
+    data = make_synthetic_residual_data()
+    split_col = data.split_col.replace({"validation": "train"})
+    finder = ResidualSignalFinder(split_strategy="holdout", random_state=42)
+
+    result = finder.fit(X=data.X, y_true=data.y_true, y_pred=data.y_pred, split_col=split_col)
+
+    assert result.fold_scores["split"].tolist() == ["holdout"]
+    assert result.binned_diagnostics["residual_signal"]["n_obs"].sum() == 20
+
+
+def test_holdout_rejects_missing_train_label() -> None:
+    data = make_synthetic_residual_data()
+    split_col = data.split_col.replace({"train": "validation"})
+    finder = ResidualSignalFinder(split_strategy="holdout", random_state=42)
+
+    with pytest.raises(ValueError, match="train label"):
+        finder.fit(X=data.X, y_true=data.y_true, y_pred=data.y_pred, split_col=split_col)
+
+
 def test_group_cv_requires_group_col() -> None:
     data = make_synthetic_residual_data()
     finder = ResidualSignalFinder(split_strategy="group_cv", group_col=None, random_state=42)
 
     with pytest.raises(ValueError, match="group_col.*required.*group_cv"):
         finder.fit(X=data.X, y_true=data.y_true, y_pred=data.y_pred)
+
+
+def test_group_cv_keeps_groups_separated() -> None:
+    data = make_synthetic_residual_data()
+    finder = ResidualSignalFinder(
+        split_strategy="group_cv",
+        group_col="group",
+        n_splits=4,
+        random_state=42,
+    )
+
+    result = finder.fit(X=data.X, y_true=data.y_true, y_pred=data.y_pred)
+
+    seen_groups: set[int] = set()
+    for groups in result.fold_scores["test_groups"]:
+        fold_groups = set(groups)
+        assert seen_groups.isdisjoint(fold_groups)
+        seen_groups.update(fold_groups)
+    assert seen_groups == set(data.X["group"].unique())
+    assert "group" not in set(result.feature_importance["feature"])
+
+
+def test_group_cv_returns_expected_number_of_folds() -> None:
+    data = make_synthetic_residual_data()
+    finder = ResidualSignalFinder(
+        split_strategy="group_cv",
+        group_col="group",
+        n_splits=3,
+        random_state=42,
+    )
+
+    result = finder.fit(X=data.X, y_true=data.y_true, y_pred=data.y_pred)
+
+    assert len(result.fold_scores) == 3
+    assert len(result.models) == 3
+
+
+def test_group_cv_is_reproducible() -> None:
+    data = make_synthetic_residual_data()
+    first = ResidualSignalFinder(
+        split_strategy="group_cv",
+        group_col="group",
+        n_splits=4,
+        random_state=42,
+    ).fit(X=data.X, y_true=data.y_true, y_pred=data.y_pred)
+    second = ResidualSignalFinder(
+        split_strategy="group_cv",
+        group_col="group",
+        n_splits=4,
+        random_state=42,
+    ).fit(X=data.X, y_true=data.y_true, y_pred=data.y_pred)
+
+    pd.testing.assert_frame_equal(first.fold_scores, second.fold_scores)
+    pd.testing.assert_frame_equal(first.feature_importance, second.feature_importance)
+    assert first.residual_model_score == second.residual_model_score
+
+
+def test_bootstrap_returns_n_repeats_or_fewer_rows_if_repeats_are_skipped() -> None:
+    data = make_synthetic_residual_data()
+    finder = ResidualSignalFinder(
+        split_strategy="bootstrap",
+        n_repeats=6,
+        sample_fraction=0.8,
+        random_state=42,
+    )
+
+    result = finder.fit(X=data.X, y_true=data.y_true, y_pred=data.y_pred)
+
+    assert 0 < len(result.fold_scores) <= 6
+    assert len(result.models) == len(result.fold_scores)
+    assert result.fold_scores["repeat"].between(0, 5).all()
+    assert result.metadata["sample_fraction"] == 0.8
+
+
+def test_bootstrap_feature_stability_is_non_empty() -> None:
+    data = make_synthetic_residual_data()
+    finder = ResidualSignalFinder(
+        split_strategy="bootstrap",
+        n_repeats=5,
+        random_state=42,
+    )
+
+    result = finder.fit(X=data.X, y_true=data.y_true, y_pred=data.y_pred)
+
+    assert not result.feature_stability.empty
+    assert not result.binned_diagnostics["residual_signal"].empty
+
+
+def test_bootstrap_is_reproducible_with_random_state() -> None:
+    data = make_synthetic_residual_data()
+    first = ResidualSignalFinder(
+        split_strategy="bootstrap",
+        n_repeats=5,
+        random_state=42,
+    ).fit(X=data.X, y_true=data.y_true, y_pred=data.y_pred)
+    second = ResidualSignalFinder(
+        split_strategy="bootstrap",
+        n_repeats=5,
+        random_state=42,
+    ).fit(X=data.X, y_true=data.y_true, y_pred=data.y_pred)
+
+    pd.testing.assert_frame_equal(first.fold_scores, second.fold_scores)
+    pd.testing.assert_frame_equal(first.feature_importance, second.feature_importance)
+    assert first.residual_model_score == second.residual_model_score
+
+
+@pytest.mark.parametrize("sample_fraction", [0.0, -0.1, 1.1])
+def test_bootstrap_rejects_invalid_sample_fraction(sample_fraction: float) -> None:
+    with pytest.raises(ValueError, match="sample_fraction"):
+        ResidualSignalFinder(split_strategy="bootstrap", sample_fraction=sample_fraction)
 
 
 def test_invalid_inputs_raise_helpful_value_error() -> None:

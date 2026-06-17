@@ -9,7 +9,7 @@ import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import r2_score
-from sklearn.model_selection import KFold, StratifiedKFold
+from sklearn.model_selection import GroupKFold, KFold, StratifiedKFold
 from xgboost import XGBRegressor
 
 ModelType = Literal["xgboost", "random_forest"]
@@ -57,6 +57,7 @@ class ResidualSignalFinder:
     split_strategy: SplitStrategy = "cv"
     n_splits: int = 5
     n_repeats: int = 1
+    sample_fraction: float = 0.8
     stratify_col: str | None = None
     group_col: str | None = None
     random_state: int | None = None
@@ -69,6 +70,10 @@ class ResidualSignalFinder:
             raise ValueError("split_strategy must be one of: cv, holdout, group_cv, bootstrap")
         if self.n_splits < 2:
             raise ValueError("n_splits must be at least 2")
+        if self.n_repeats < 1:
+            raise ValueError("n_repeats must be at least 1")
+        if not 0.0 < self.sample_fraction <= 1.0:
+            raise ValueError("sample_fraction must be greater than 0 and no more than 1")
         if self.n_bins < 2:
             raise ValueError("n_bins must be at least 2")
         if self.n_estimators < 1:
@@ -89,8 +94,6 @@ class ResidualSignalFinder:
             raise ValueError("split_col is required when split_strategy='holdout'")
         if self.split_strategy == "group_cv" and self.group_col is None:
             raise ValueError("group_col is required when split_strategy='group_cv'")
-        if self.split_strategy != "cv":
-            raise NotImplementedError("Only split_strategy='cv' is implemented.")
 
         X_valid, y_true_valid, y_pred_valid, weight_values = self._validate_fit_inputs(
             X=X,
@@ -100,15 +103,41 @@ class ResidualSignalFinder:
             split_col=split_col,
         )
         residuals = pd.Series(y_true_valid - y_pred_valid, index=X_valid.index, name="residual")
-        feature_names = list(X_valid.columns)
+        split_series = (
+            _coerce_series(split_col, name="split_col", index=X_valid.index)
+            if split_col is not None
+            else None
+        )
+
+        if self.split_strategy == "holdout":
+            if split_series is None:
+                raise ValueError("split_col is required when split_strategy='holdout'")
+            return self._fit_holdout(
+                X=X_valid,
+                residuals=residuals,
+                sample_weight=weight_values,
+                split_col=split_series,
+                sample_weight_used=sample_weight is not None,
+            )
+
+        model_X, groups = self._model_frame_and_groups(X_valid)
+        if self.split_strategy == "bootstrap":
+            return self._fit_bootstrap(
+                X=model_X,
+                residuals=residuals,
+                sample_weight=weight_values,
+                sample_weight_used=sample_weight is not None,
+            )
+
+        feature_names = list(model_X.columns)
         fold_scores: list[dict[str, Any]] = []
         fold_importance_frames: list[pd.DataFrame] = []
         models: list[Any] = []
         oof_predictions = pd.Series(np.nan, index=X_valid.index, name="predicted_residual")
 
-        for fold, (train_idx, test_idx) in enumerate(self._cv_splits(X_valid, residuals)):
-            X_train = X_valid.iloc[train_idx]
-            X_test = X_valid.iloc[test_idx]
+        for fold, (train_idx, test_idx) in enumerate(self._cv_splits(model_X, groups)):
+            X_train = model_X.iloc[train_idx]
+            X_test = model_X.iloc[test_idx]
             y_train = residuals.iloc[train_idx]
             y_test = residuals.iloc[test_idx]
             train_weight = weight_values[train_idx] if weight_values is not None else None
@@ -131,6 +160,9 @@ class ResidualSignalFinder:
                     "validation_score": test_r2,
                     "train_size": len(train_idx),
                     "test_size": len(test_idx),
+                    "test_groups": (
+                        _unique_sorted_tuple(groups.iloc[test_idx]) if groups is not None else ()
+                    ),
                 }
             )
             fold_importance_frames.append(self._feature_importance(model, feature_names, fold))
@@ -140,25 +172,11 @@ class ResidualSignalFinder:
         fold_feature_importance = pd.concat(fold_importance_frames, ignore_index=True)
         feature_importance = self._aggregate_feature_importance(fold_feature_importance)
         feature_stability = self._feature_stability(fold_feature_importance)
-        binned_diagnostics = self._binned_diagnostics(X_valid, residuals, oof_predictions)
+        binned_diagnostics = self._binned_diagnostics(model_X, residuals, oof_predictions)
         residual_model_score = {
             "mean_train_r2": float(fold_scores_frame["train_r2"].mean()),
             "mean_test_r2": float(fold_scores_frame["test_r2"].mean()),
             "std_test_r2": float(fold_scores_frame["test_r2"].std(ddof=0)),
-        }
-        metadata = {
-            "model_type": self.model_type,
-            "max_depth": self.max_depth,
-            "n_estimators": self.n_estimators,
-            "learning_rate": self.learning_rate,
-            "n_bins": self.n_bins,
-            "split_strategy": self.split_strategy,
-            "n_splits": self.n_splits,
-            "n_repeats": self.n_repeats,
-            "stratify_col": self.stratify_col,
-            "group_col": self.group_col,
-            "random_state": self.random_state,
-            "sample_weight_used": sample_weight is not None,
         }
         return ResidualSignalFinderResult(
             residuals=residuals,
@@ -168,9 +186,200 @@ class ResidualSignalFinder:
             residual_model_score=residual_model_score,
             fold_scores=fold_scores_frame,
             fold_feature_importance=fold_feature_importance,
-            metadata=metadata,
+            metadata=self._metadata(sample_weight is not None),
             models=models,
         )
+
+    def _fit_holdout(
+        self,
+        *,
+        X: pd.DataFrame,
+        residuals: pd.Series,
+        sample_weight: np.ndarray[Any, Any] | None,
+        split_col: pd.Series,
+        sample_weight_used: bool,
+    ) -> ResidualSignalFinderResult:
+        allowed_labels = {"train", "validation", "holdout"}
+        split_labels = split_col.astype(str)
+        labels = set(split_labels)
+        invalid_labels = sorted(labels - allowed_labels)
+        if invalid_labels:
+            raise ValueError(
+                "split_col labels must be one of: train, validation, holdout; "
+                f"invalid labels: {invalid_labels}"
+            )
+        train_mask = split_labels == "train"
+        if not train_mask.any():
+            raise ValueError("split_col must contain at least one train label")
+        score_labels = [
+            label for label in ("validation", "holdout") if (split_labels == label).any()
+        ]
+        if not score_labels:
+            raise ValueError("split_col must contain validation or holdout labels")
+
+        feature_names = list(X.columns)
+        train_idx = np.flatnonzero(train_mask.to_numpy())
+        train_weight = sample_weight[train_idx] if sample_weight is not None else None
+        model = self._make_model()
+        fit_kwargs = {"sample_weight": train_weight} if train_weight is not None else {}
+        model.fit(X.iloc[train_idx], residuals.iloc[train_idx], **fit_kwargs)
+        train_pred = model.predict(X.iloc[train_idx])
+        train_r2 = float(
+            r2_score(residuals.iloc[train_idx], train_pred, sample_weight=train_weight)
+        )
+
+        fold_scores: list[dict[str, Any]] = []
+        predictions = pd.Series(np.nan, index=X.index, name="predicted_residual")
+        for fold, label in enumerate(score_labels):
+            test_mask = split_labels == label
+            test_idx = np.flatnonzero(test_mask.to_numpy())
+            test_weight = sample_weight[test_idx] if sample_weight is not None else None
+            test_pred = model.predict(X.iloc[test_idx])
+            predictions.iloc[test_idx] = test_pred
+            test_r2 = float(
+                r2_score(residuals.iloc[test_idx], test_pred, sample_weight=test_weight)
+            )
+            fold_scores.append(
+                {
+                    "fold": fold,
+                    "split": label,
+                    "train_r2": train_r2,
+                    "test_r2": test_r2,
+                    "validation_score": test_r2,
+                    "train_size": len(train_idx),
+                    "test_size": len(test_idx),
+                }
+            )
+
+        fold_scores_frame = pd.DataFrame(fold_scores)
+        fold_feature_importance = self._feature_importance(model, feature_names, 0)
+        feature_importance = self._aggregate_feature_importance(fold_feature_importance)
+        feature_stability = self._feature_stability(fold_feature_importance)
+        eval_mask = split_labels.isin(["validation", "holdout"])
+        binned_diagnostics = self._binned_diagnostics(
+            X.loc[eval_mask],
+            residuals.loc[eval_mask],
+            predictions.loc[eval_mask],
+        )
+        residual_model_score = {
+            "train_r2": train_r2,
+            "mean_test_r2": float(fold_scores_frame["test_r2"].mean()),
+            "std_test_r2": float(fold_scores_frame["test_r2"].std(ddof=0)),
+        }
+        for row in fold_scores:
+            residual_model_score[f"{row['split']}_r2"] = float(row["test_r2"])
+
+        return ResidualSignalFinderResult(
+            residuals=residuals,
+            feature_importance=feature_importance,
+            feature_stability=feature_stability,
+            binned_diagnostics=binned_diagnostics,
+            residual_model_score=residual_model_score,
+            fold_scores=fold_scores_frame,
+            fold_feature_importance=fold_feature_importance,
+            metadata=self._metadata(sample_weight_used),
+            models=[model],
+        )
+
+    def _fit_bootstrap(
+        self,
+        *,
+        X: pd.DataFrame,
+        residuals: pd.Series,
+        sample_weight: np.ndarray[Any, Any] | None,
+        sample_weight_used: bool,
+    ) -> ResidualSignalFinderResult:
+        rng = np.random.default_rng(self.random_state)
+        row_count = len(X)
+        train_size = max(1, int(round(row_count * self.sample_fraction)))
+        feature_names = list(X.columns)
+        fold_scores: list[dict[str, Any]] = []
+        fold_importance_frames: list[pd.DataFrame] = []
+        models: list[Any] = []
+        prediction_sum = pd.Series(0.0, index=X.index, name="predicted_residual")
+        prediction_count = pd.Series(0, index=X.index, name="prediction_count")
+
+        for repeat in range(self.n_repeats):
+            train_idx = rng.choice(row_count, size=train_size, replace=True)
+            oob_mask = np.ones(row_count, dtype=bool)
+            oob_mask[np.unique(train_idx)] = False
+            test_idx = np.flatnonzero(oob_mask)
+            if len(test_idx) == 0:
+                continue
+
+            train_weight = sample_weight[train_idx] if sample_weight is not None else None
+            test_weight = sample_weight[test_idx] if sample_weight is not None else None
+            model = self._make_model()
+            fit_kwargs = {"sample_weight": train_weight} if train_weight is not None else {}
+            model.fit(X.iloc[train_idx], residuals.iloc[train_idx], **fit_kwargs)
+            train_pred = model.predict(X.iloc[train_idx])
+            test_pred = model.predict(X.iloc[test_idx])
+
+            train_r2 = float(
+                r2_score(residuals.iloc[train_idx], train_pred, sample_weight=train_weight)
+            )
+            test_r2 = float(
+                r2_score(residuals.iloc[test_idx], test_pred, sample_weight=test_weight)
+            )
+            fold_scores.append(
+                {
+                    "fold": repeat,
+                    "repeat": repeat,
+                    "train_r2": train_r2,
+                    "test_r2": test_r2,
+                    "validation_score": test_r2,
+                    "train_size": len(train_idx),
+                    "test_size": len(test_idx),
+                }
+            )
+            fold_importance_frames.append(self._feature_importance(model, feature_names, repeat))
+            models.append(model)
+            prediction_sum.iloc[test_idx] = prediction_sum.iloc[test_idx] + test_pred
+            prediction_count.iloc[test_idx] = prediction_count.iloc[test_idx] + 1
+
+        if not fold_scores:
+            raise ValueError("No bootstrap repeats produced out-of-bag rows")
+
+        fold_scores_frame = pd.DataFrame(fold_scores)
+        fold_feature_importance = pd.concat(fold_importance_frames, ignore_index=True)
+        feature_importance = self._aggregate_feature_importance(fold_feature_importance)
+        feature_stability = self._feature_stability(fold_feature_importance)
+        predictions = prediction_sum / prediction_count.replace(0, np.nan)
+        binned_diagnostics = self._binned_diagnostics(X, residuals, predictions)
+        residual_model_score = {
+            "mean_train_r2": float(fold_scores_frame["train_r2"].mean()),
+            "mean_test_r2": float(fold_scores_frame["test_r2"].mean()),
+            "std_test_r2": float(fold_scores_frame["test_r2"].std(ddof=0)),
+        }
+
+        return ResidualSignalFinderResult(
+            residuals=residuals,
+            feature_importance=feature_importance,
+            feature_stability=feature_stability,
+            binned_diagnostics=binned_diagnostics,
+            residual_model_score=residual_model_score,
+            fold_scores=fold_scores_frame,
+            fold_feature_importance=fold_feature_importance,
+            metadata=self._metadata(sample_weight_used),
+            models=models,
+        )
+
+    def _metadata(self, sample_weight_used: bool) -> dict[str, Any]:
+        return {
+            "model_type": self.model_type,
+            "max_depth": self.max_depth,
+            "n_estimators": self.n_estimators,
+            "learning_rate": self.learning_rate,
+            "n_bins": self.n_bins,
+            "split_strategy": self.split_strategy,
+            "n_splits": self.n_splits,
+            "n_repeats": self.n_repeats,
+            "sample_fraction": self.sample_fraction,
+            "stratify_col": self.stratify_col,
+            "group_col": self.group_col,
+            "random_state": self.random_state,
+            "sample_weight_used": sample_weight_used,
+        }
 
     def _validate_fit_inputs(
         self,
@@ -223,11 +432,25 @@ class ResidualSignalFinder:
 
         return X.copy(), y_true_valid, y_pred_valid, weight_values
 
-    def _cv_splits(
-        self,
-        X: pd.DataFrame,
-        residuals: pd.Series,
-    ) -> Any:
+    def _model_frame_and_groups(self, X: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series | None]:
+        if self.split_strategy != "group_cv":
+            return X, None
+        if self.group_col is None:
+            raise ValueError("group_col is required when split_strategy='group_cv'")
+        if self.group_col not in X.columns:
+            raise ValueError(f"group_col '{self.group_col}' must be a column in X")
+        groups = X[self.group_col].copy()
+        if groups.nunique() < self.n_splits:
+            raise ValueError("group_col must contain at least n_splits unique groups")
+        return X.drop(columns=[self.group_col]), groups
+
+    def _cv_splits(self, X: pd.DataFrame, groups: pd.Series | None) -> Any:
+        if self.split_strategy == "group_cv":
+            if groups is None:
+                raise ValueError("group_col is required when split_strategy='group_cv'")
+            splitter = GroupKFold(n_splits=self.n_splits)
+            return splitter.split(X, groups=groups)
+
         if self.stratify_col is None:
             splitter = KFold(n_splits=self.n_splits, shuffle=True, random_state=self.random_state)
             return splitter.split(X)
@@ -402,6 +625,10 @@ def _map_xgboost_importance(
             if feature_index < len(feature_names):
                 importance[feature_names[feature_index]] = float(score)
     return importance
+
+
+def _unique_sorted_tuple(values: pd.Series) -> tuple[Any, ...]:
+    return tuple(sorted(values.dropna().unique().tolist()))
 
 
 def residualize(values: pd.Series, controls: pd.DataFrame) -> pd.Series:
