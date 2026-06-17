@@ -72,3 +72,7 @@ eggs/
 # Operating System temporary files
 .DS_Store
 Thumbs.db
+
+# Python bytecode and cache directories
+__pycache__/
+*.pyc
