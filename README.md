@@ -31,3 +31,7 @@ mean within each split before scoring and binned diagnostics.
 
 When SHAP interaction values are available, `plot_top_interactions()` creates
 saved heatmap figures for the strongest feature pairs.
+
+Residual diagnostic plots show out-of-sample binned actuals, predictions, and
+paired errors with 95% confidence intervals; the error series is shown in a
+separate lower panel with a centered zero reference line.

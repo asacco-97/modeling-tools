@@ -921,8 +921,11 @@ class ResidualSignalFinder:
                 "n_obs": ("actual", "size"),
                 "feature_mean": ("feature_value", "mean"),
                 "actual_mean": ("actual", "mean"),
+                "actual_std": ("actual", "std"),
                 "predicted_mean": ("predicted", "mean"),
+                "predicted_std": ("predicted", "std"),
                 "error_mean": ("prediction_error", "mean"),
+                "error_std": ("prediction_error", "std"),
             }
             if task_type != "binary_classification":
                 aggregations.update(
@@ -937,6 +940,7 @@ class ResidualSignalFinder:
                 .agg(**aggregations)
                 .reset_index()
             )
+            feature_diagnostics = _add_mean_ci_columns(feature_diagnostics)
             diagnostics[str(feature)] = feature_diagnostics
         return diagnostics
 
@@ -1101,6 +1105,23 @@ def _offbalance_predictions(
     target_level = float(np.mean(target_values))
     prediction_level = float(np.mean(adjusted))
     return adjusted + (target_level - prediction_level)
+
+
+def _add_mean_ci_columns(frame: pd.DataFrame, z_value: float = 1.96) -> pd.DataFrame:
+    result = frame.copy()
+    row_count = result["n_obs"].astype(float).clip(lower=1.0)
+    for prefix in ("actual", "predicted", "error"):
+        mean_col = f"{prefix}_mean"
+        std_col = f"{prefix}_std"
+        if mean_col not in result.columns or std_col not in result.columns:
+            continue
+        std_values = pd.to_numeric(result[std_col]).fillna(0.0)
+        margin = z_value * std_values / np.sqrt(row_count)
+        result[f"{prefix}_ci_low"] = result[mean_col] - margin
+        result[f"{prefix}_ci_high"] = result[mean_col] + margin
+
+    std_columns = [column for column in result.columns if str(column).endswith("_std")]
+    return result.drop(columns=std_columns)
 
 
 def _coerce_series(values: LabelLike, *, name: str, index: pd.Index) -> pd.Series:
@@ -1332,49 +1353,140 @@ def _html_table(frame: pd.DataFrame) -> str:
 
 def _plot_binned_diagnostics(feature: str, diagnostics: pd.DataFrame) -> Figure:
     if {"actual_mean", "predicted_mean", "error_mean"}.issubset(diagnostics.columns):
-        series_specs = [
-            ("actual_mean", "Mean actual"),
-            ("predicted_mean", "Mean predicted"),
-            ("error_mean", "Mean error"),
-        ]
+        actual_prefix = "actual"
+        predicted_prefix = "predicted"
+        error_prefix = "error"
+        actual_label = "Mean actual"
+        predicted_label = "Mean predicted"
+        error_label = "Mean error"
     else:
-        series_specs = [
-            ("residual_mean", "Mean actual"),
-            ("predicted_residual_mean", "Mean predicted"),
-            ("prediction_error_mean", "Mean residual"),
-        ]
-    required_columns = {column for column, _label in series_specs}
+        actual_prefix = "residual"
+        predicted_prefix = "predicted_residual"
+        error_prefix = "prediction_error"
+        actual_label = "Mean actual"
+        predicted_label = "Mean predicted"
+        error_label = "Mean residual"
+
+    required_columns = {
+        f"{actual_prefix}_mean",
+        f"{predicted_prefix}_mean",
+        f"{error_prefix}_mean",
+    }
     missing_columns = sorted(required_columns - set(diagnostics.columns))
     if missing_columns:
         raise ValueError(f"binned diagnostics missing columns: {missing_columns}")
 
-    figure = Figure(figsize=(8, 4.5))
-    axes = figure.subplots()
+    figure = Figure(figsize=(9.5, 6.4))
+    mean_axes, error_axes = figure.subplots(
+        2,
+        1,
+        sharex=True,
+        gridspec_kw={"height_ratios": [2.2, 1.0]},
+    )
     x_values = np.arange(len(diagnostics))
     x_labels = (
         diagnostics["bin"].astype(str).tolist()
         if "bin" in diagnostics.columns
         else [str(value) for value in x_values]
     )
-    for column, label in series_specs:
-        axes.plot(
-            x_values,
-            pd.to_numeric(diagnostics[column]),
-            marker="o",
-            linewidth=1.6,
-            label=label,
-        )
 
-    axes.axhline(0.0, color="black", linewidth=0.8, alpha=0.5)
-    axes.set_title(f"Residual Signal Diagnostics: {feature}")
-    axes.set_xlabel("Feature bin")
-    axes.set_ylabel("Mean value")
-    axes.set_xticks(x_values)
-    axes.set_xticklabels(x_labels, rotation=45, ha="right")
-    axes.legend()
-    axes.grid(True, alpha=0.25)
+    _plot_line_with_ci(
+        mean_axes,
+        x_values,
+        diagnostics,
+        actual_prefix,
+        actual_label,
+        color="tab:blue",
+    )
+    _plot_line_with_ci(
+        mean_axes,
+        x_values,
+        diagnostics,
+        predicted_prefix,
+        predicted_label,
+        color="tab:orange",
+    )
+    _plot_line_with_ci(
+        error_axes,
+        x_values,
+        diagnostics,
+        error_prefix,
+        error_label,
+        color="darkgray",
+        marker="s",
+    )
+
+    error_axes.axhline(0.0, color="darkgray", linewidth=1.0, linestyle=":", alpha=0.95)
+    _center_error_axis(error_axes, diagnostics, error_prefix)
+
+    mean_axes.set_title(f"Out-of-Sample Bin Diagnostics: {feature}")
+    mean_axes.set_ylabel("Mean actual / predicted")
+    error_axes.set_ylabel("Mean Error")
+    error_axes.set_xlabel("Feature bin")
+    error_axes.set_xticks(x_values)
+    error_axes.set_xticklabels(x_labels, rotation=45, ha="right")
+    mean_axes.legend()
+    error_axes.legend()
+    mean_axes.grid(True, alpha=0.25)
+    error_axes.grid(True, alpha=0.25)
     figure.tight_layout()
     return figure
+
+
+def _plot_line_with_ci(
+    axes: Any,
+    x_values: np.ndarray[Any, Any],
+    diagnostics: pd.DataFrame,
+    prefix: str,
+    label: str,
+    *,
+    color: str,
+    marker: str = "o",
+) -> None:
+    mean_values = pd.to_numeric(diagnostics[f"{prefix}_mean"]).to_numpy(dtype=float)
+    axes.plot(
+        x_values,
+        mean_values,
+        marker=marker,
+        linewidth=1.7,
+        color=color,
+        label=label,
+    )
+    low_col = f"{prefix}_ci_low"
+    high_col = f"{prefix}_ci_high"
+    if {low_col, high_col}.issubset(diagnostics.columns):
+        axes.fill_between(
+            x_values,
+            pd.to_numeric(diagnostics[low_col]).to_numpy(dtype=float),
+            pd.to_numeric(diagnostics[high_col]).to_numpy(dtype=float),
+            color=color,
+            alpha=0.18,
+            linewidth=0.0,
+        )
+
+
+def _ci_yerr(diagnostics: pd.DataFrame, prefix: str) -> np.ndarray[Any, Any] | None:
+    mean_col = f"{prefix}_mean"
+    low_col = f"{prefix}_ci_low"
+    high_col = f"{prefix}_ci_high"
+    if not {mean_col, low_col, high_col}.issubset(diagnostics.columns):
+        return None
+
+    mean = pd.to_numeric(diagnostics[mean_col]).to_numpy(dtype=float)
+    low = pd.to_numeric(diagnostics[low_col]).to_numpy(dtype=float)
+    high = pd.to_numeric(diagnostics[high_col]).to_numpy(dtype=float)
+    return np.vstack([np.maximum(mean - low, 0.0), np.maximum(high - mean, 0.0)])
+
+
+def _center_error_axis(axes: Any, diagnostics: pd.DataFrame, prefix: str) -> None:
+    columns = [f"{prefix}_mean", f"{prefix}_ci_low", f"{prefix}_ci_high"]
+    available_columns = [column for column in columns if column in diagnostics.columns]
+    values = pd.to_numeric(diagnostics.loc[:, available_columns].stack(), errors="coerce")
+    max_abs = float(values.abs().max()) if not values.empty else 0.0
+    if not np.isfinite(max_abs) or np.isclose(max_abs, 0.0):
+        max_abs = 1.0
+    margin = max_abs * 1.08
+    axes.set_ylim(-margin, margin)
 
 
 def _plot_interaction_diagnostics(
@@ -1426,7 +1538,7 @@ def _plot_interaction_diagnostics(
         axes[axes_index].set_yticklabels([str(value) for value in pivot.index])
         figure.colorbar(image, ax=axes[axes_index], fraction=0.046, pad=0.04)
 
-    figure.suptitle(f"Interaction Diagnostics: {feature_1} × {feature_2}")
+    figure.suptitle(f"Interaction Diagnostics: {feature_1} ? {feature_2}")
     figure.tight_layout()
     return figure
 
