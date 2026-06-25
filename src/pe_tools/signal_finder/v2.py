@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import base64
+import html as _html
+import io
+import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from itertools import combinations
@@ -29,7 +33,6 @@ OOF_WARNING = (
     "out-of-sample predictions. In-sample predictions can hide residual signal or create "
     "misleading artifacts."
 )
-
 
 @dataclass(frozen=True)
 class _BinSpec:
@@ -71,7 +74,6 @@ class ResidualSignalFinderV2:
     r2_epsilon: float = 0.001
     n_bins: int = 10
     null_strategy: NullStrategy = "permuted_features"
-    n_null_features: int = 20
     random_state: int = 42
     max_categories: int = 20
     min_category_count: int = 30
@@ -80,6 +82,8 @@ class ResidualSignalFinderV2:
     use_sample_weight: bool = False
     strong_r2_threshold: float = 0.02
     model_params: dict[str, Any] | None = None
+    subsample_max_train_size: int | None = None
+    subsample_positive_class_target_perc: float = 0.30
 
     summary_: pd.DataFrame = field(init=False, default_factory=pd.DataFrame)
     bootstrap_results_: pd.DataFrame = field(init=False, default_factory=pd.DataFrame)
@@ -127,8 +131,6 @@ class ResidualSignalFinderV2:
             raise ValueError(
                 "null_strategy must be one of: permuted_features, random_noise, shuffled_residuals"
             )
-        if self.n_null_features < 0:
-            raise ValueError("n_null_features cannot be negative")
         if self.max_categories < 2:
             raise ValueError("max_categories must be at least 2")
         if self.min_category_count < 1:
@@ -139,6 +141,10 @@ class ResidualSignalFinderV2:
             raise ValueError("classification_scatter_max_bin_size must be at least 1")
         if self.strong_r2_threshold <= 0:
             raise ValueError("strong_r2_threshold must be positive")
+        if self.subsample_max_train_size is not None and self.subsample_max_train_size < 1:
+            raise ValueError("subsample_max_train_size must be at least 1")
+        if not 0.0 < self.subsample_positive_class_target_perc < 1.0:
+            raise ValueError("subsample_positive_class_target_perc must be between 0 and 1")
 
     def fit(
         self,
@@ -179,13 +185,17 @@ class ResidualSignalFinderV2:
         self.warnings_ = [OOF_WARNING]
         self.residual_summary_ = _residual_summary(residuals)
         _add_data_warnings(self.warnings_, features, residuals, self)
+        runtime_warnings = _warn_large_dataset(len(features), len(features.columns), self)
+        self.warnings_.extend(runtime_warnings)
 
+        segment_values: pd.Series | None = None
         if segment_cols:
             missing_segments = [column for column in segment_cols if column not in features.columns]
             if missing_segments:
                 raise ValueError(f"segment_cols not found in X: {missing_segments}")
+            segment_values = _make_composite_segment(features, list(segment_cols))
 
-        split_specs = self._make_splits(features, group_values, splits)
+        split_specs = self._make_splits(features, group_values, splits, segment_values)
         if not split_specs:
             raise ValueError("No valid train/validation splits were created")
 
@@ -317,16 +327,22 @@ class ResidualSignalFinderV2:
 
         import matplotlib.pyplot as plt
 
-        curve = _feature_curve_summary(self.effect_curves_, feature_name)
+        filtered_ec = _drop_degenerate_bins(self.effect_curves_, feature_name)
+        curve = _feature_curve_summary(filtered_ec, feature_name)
         bins = curve["bin_label"].astype(str).tolist()
         x = np.arange(len(bins))
-        figure = plt.figure(figsize=(17, 19))
-        grid = figure.add_gridspec(4, 2, height_ratios=[1.0, 1.2, 1.0, 1.0])
+        figure = plt.figure(figsize=(17, 18))
+        grid = figure.add_gridspec(
+            4, 2,
+            height_ratios=[1.3, 1.3, 0.35, 1.0],
+            hspace=0.55,
+            wspace=0.35,
+        )
         actual_axis = figure.add_subplot(grid[0, :])
-        effect_axis = figure.add_subplot(grid[1, :], sharex=actual_axis)
-        stability_axis = figure.add_subplot(grid[2, 0])
-        null_axis = figure.add_subplot(grid[2, 1])
-        scatter_axis = figure.add_subplot(grid[3, :])
+        boxplot_axis = figure.add_subplot(grid[1, :], sharex=actual_axis)
+        count_axis = figure.add_subplot(grid[2, :], sharex=actual_axis)
+        partial_axis = figure.add_subplot(grid[3, 0])
+        stability_axis = figure.add_subplot(grid[3, 1])
 
         actual_axis.plot(x, curve["actual_mean"], marker="o", label="actual")
         actual_axis.fill_between(
@@ -348,16 +364,19 @@ class ResidualSignalFinderV2:
         actual_axis.set_ylabel("Mean actual / prediction")
         actual_axis.legend(loc="best")
 
-        self._plot_effect_curve_stability_on_axis(feature_name, effect_axis)
-        self._plot_effect_curve_correlation_on_axis(feature_name, stability_axis)
-        self._plot_null_comparison_on_axis(feature_name, null_axis)
-        self._plot_residual_scatter_on_axis(feature_name, scatter_axis)
+        self._plot_residual_boxplot_on_axis(feature_name, boxplot_axis, bins, filtered_ec, curve)
+        self._plot_bin_counts_on_axis(feature_name, count_axis, bins, x)
+        self._plot_partial_residual_on_axis(feature_name, partial_axis, curve, filtered_ec)
+        self._plot_bootstrap_r2_distribution_on_axis(feature_name, stability_axis)
 
         actual_axis.set_xticks(x)
         actual_axis.set_xticklabels([])
-        effect_axis.set_xticks(x)
-        effect_axis.set_xticklabels(bins, rotation=35, ha="right")
-        effect_axis.tick_params(axis="x", labelsize=9)
+        boxplot_axis.set_xticks(x)
+        boxplot_axis.set_xticklabels([])
+        count_axis.set_xticks(x)
+        count_axis.set_xticklabels(bins)
+        count_axis.tick_params(axis="x", labelsize=9)
+        plt.setp(count_axis.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
         figure.suptitle(f"Residual Signal Diagnostics: {feature_name}", y=1.01)
         figure.tight_layout()
         return figure
@@ -370,46 +389,6 @@ class ResidualSignalFinderV2:
             feature: self.plot_feature_diagnostics(feature)
             for feature in self.summary_.head(n)["feature"].astype(str)
         }
-
-    def plot_effect_curve(self, feature_name: str) -> Figure:
-        """Plot the average centered residual curve for one feature."""
-        _require_fitted(self.summary_, "summary_")
-        self._require_feature(feature_name)
-
-        import matplotlib.pyplot as plt
-
-        curve = _feature_curve_summary(self.effect_curves_, feature_name)
-        x = np.arange(len(curve))
-        figure, axis = plt.subplots(figsize=(10, 5))
-        axis.plot(x, curve["centered_mean_residual"], marker="o", color="black")
-        axis.fill_between(
-            x,
-            curve["centered_residual_p05"],
-            curve["centered_residual_p95"],
-            color="black",
-            alpha=0.15,
-            label="5p to 95p bootstrap band",
-        )
-        axis.axhline(0.0, linestyle=":", color="black")
-        axis.set_xticks(x)
-        axis.set_xticklabels(curve["bin_label"].astype(str), rotation=45, ha="right")
-        axis.set_title(f"Residual Effect Curve: {feature_name}")
-        axis.set_ylabel("Centered mean residual")
-        axis.legend(loc="best")
-        figure.tight_layout()
-        return figure
-
-    def plot_null_comparison(self, feature_name: str) -> Figure:
-        """Plot real feature bootstrap scores against the null score distribution."""
-        _require_fitted(self.summary_, "summary_")
-        self._require_feature(feature_name)
-
-        import matplotlib.pyplot as plt
-
-        figure, axis = plt.subplots(figsize=(8, 5))
-        self._plot_null_comparison_on_axis(feature_name, axis)
-        figure.tight_layout()
-        return figure
 
     def plot_rank_stability(self, n: int = 20) -> Figure:
         """Plot mean and median residual-signal rank for top features."""
@@ -473,6 +452,98 @@ class ResidualSignalFinderV2:
         axis.set_title("Residual Signal Map")
         figure.tight_layout()
         return figure
+
+    def to_html(
+        self,
+        path: str | None = None,
+        title: str | None = None,
+        top_n: int = 10,
+    ) -> str:
+        """Render a self-contained HTML report and optionally write it to disk.
+
+        Args:
+            path: Optional file path to write the HTML. If None, returns the string only.
+            title: Report title. Defaults to "Residual Signal Report".
+            top_n: Number of top features to include in the ranking table and detail cards.
+
+        Returns:
+            The full HTML string.
+        """
+        from datetime import datetime
+
+        import matplotlib.pyplot as plt
+
+        _require_fitted(self.summary_, "summary_")
+        effective_title = title or "Residual Signal Report"
+        generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+        summary = self.summary_.copy()
+        res_summary = getattr(self, "residual_summary_", {})
+        exec_items: list[tuple[str, str]] = [
+            ("Observations", f"{res_summary.get('n_obs', '—'):,}" if "n_obs" in res_summary else "—"),
+            ("Residual mean", f"{res_summary.get('mean', float('nan')):.4f}" if "mean" in res_summary else "—"),
+            ("Residual std", f"{res_summary.get('std', float('nan')):.4f}" if "std" in res_summary else "—"),
+            ("Features screened", str(len(summary))),
+            ("Bootstrap runs", str(getattr(self, "n_bootstraps", "—"))),
+        ]
+
+        ranking_cols = [
+            c for c in [
+                "feature",
+                "feature_type",
+                "mean_oof_residual_r2",
+                "null_beat_rate",
+                "median_effect_curve_spearman_stability",
+                "mean_oof_abs_residual_r2",
+                "pct_positive_feature_residual_spearman",
+            ]
+            if c in summary.columns
+        ]
+        top_summary = summary.head(top_n)[ranking_cols].copy()
+        for col in [
+            "mean_oof_residual_r2",
+            "null_beat_rate",
+            "median_effect_curve_spearman_stability",
+            "mean_oof_abs_residual_r2",
+            "pct_positive_feature_residual_spearman",
+        ]:
+            if col in top_summary.columns and col != "null_beat_rate":
+                top_summary[col] = top_summary[col].map(
+                    lambda v: f"{v:.3f}" if pd.notna(v) else ""
+                )
+            elif col in top_summary.columns:
+                top_summary[col] = top_summary[col].map(
+                    lambda v: f"{v:.2f}" if pd.notna(v) else ""
+                )
+
+        feature_figures: list[tuple[str, str | None]] = []
+        top_features = list(summary.head(top_n)["feature"]) if "feature" in summary.columns else []
+        for feature_name in top_features:
+            try:
+                fig = self.plot_feature_diagnostics(feature_name)
+                img_b64 = _figure_to_base64(fig)
+                plt.close(fig)
+            except Exception:
+                img_b64 = None
+            feature_figures.append((feature_name, img_b64))
+
+        warning_messages = list(getattr(self, "warnings_", []))
+
+        html_str = _build_html_report(
+            title=effective_title,
+            generated_at=generated_at,
+            exec_items=exec_items,
+            ranking_df=top_summary,
+            feature_figures=feature_figures,
+            top_n=top_n,
+            warning_messages=warning_messages,
+        )
+
+        if path is not None:
+            import pathlib
+            pathlib.Path(path).write_text(html_str, encoding="utf-8")
+
+        return html_str
 
     def _screen_features(
         self,
@@ -581,6 +652,7 @@ class ResidualSignalFinderV2:
         features: pd.DataFrame,
         group_values: pd.Series | None,
         custom_splits: Sequence[CustomSplitLike] | None,
+        segment_values: pd.Series | None = None,
     ) -> list[_SplitSpec]:
         if custom_splits is not None:
             return _normalize_custom_splits(custom_splits, features.index)
@@ -630,8 +702,13 @@ class ResidualSignalFinderV2:
         train_size = max(1, min(n_obs - 1, int(round((1.0 - self.test_size) * n_obs))))
         splits = []
         for _bootstrap_id in range(self.n_bootstraps):
-            train_idx = np.sort(rng.choice(positions, size=train_size, replace=False))
-            validation_idx = np.setdiff1d(positions, train_idx)
+            if segment_values is not None:
+                train_idx, validation_idx = _stratified_bootstrap_split(
+                    positions, segment_values, train_size, rng
+                )
+            else:
+                train_idx = np.sort(rng.choice(positions, size=train_size, replace=False))
+                validation_idx = np.setdiff1d(positions, train_idx)
             if len(validation_idx) > 0:
                 splits.append(
                     _SplitSpec(
@@ -647,22 +724,19 @@ class ResidualSignalFinderV2:
         features: pd.DataFrame,
         residuals: pd.Series,
     ) -> list[tuple[str, str, pd.Series, pd.Series]]:
-        if self.n_null_features == 0 or features.empty:
+        """Create one permuted null per candidate feature."""
+        if features.empty:
             return []
         rng = np.random.default_rng(self.random_state + 100_003)
-        source_features = rng.choice(
-            features.columns.to_numpy(),
-            size=min(self.n_null_features, len(features.columns)),
-            replace=False,
-        )
-        null_features = []
-        for null_id, source_feature in enumerate(source_features):
-            name = f"__null_{null_id}_{source_feature}"
+        candidate_features = list(features.columns)
+        null_features_list = []
+        for source_feature in candidate_features:
+            name = f"__null_{source_feature}"
             if self.null_strategy == "random_noise":
                 values = pd.Series(rng.normal(size=len(features)), index=features.index, name=name)
                 null_residuals = residuals
             elif self.null_strategy == "shuffled_residuals":
-                values = features[str(source_feature)].rename(name)
+                values = features[source_feature].rename(name)
                 null_residuals = pd.Series(
                     rng.permutation(residuals.to_numpy()),
                     index=residuals.index,
@@ -670,13 +744,13 @@ class ResidualSignalFinderV2:
                 )
             else:
                 values = pd.Series(
-                    rng.permutation(features[str(source_feature)].to_numpy()),
+                    rng.permutation(features[source_feature].to_numpy()),
                     index=features.index,
                     name=name,
                 )
                 null_residuals = residuals
-            null_features.append((name, str(source_feature), values, null_residuals))
-        return null_features
+            null_features_list.append((name, source_feature, values, null_residuals))
+        return null_features_list
 
     def _evaluate_feature(
         self,
@@ -699,12 +773,27 @@ class ResidualSignalFinderV2:
         if bin_spec is None or is_null:
             bin_spec = _make_bin_spec(values, self, sample_weight)
 
-        model_values = _model_values(values, feature_type, bin_spec, train_idx)
-        train_X = pd.DataFrame({"feature": model_values[train_idx]})
+        # Optionally subsample training rows for large datasets
+        effective_train_idx = train_idx
+        if (
+            self.subsample_max_train_size is not None
+            and len(train_idx) > self.subsample_max_train_size
+        ):
+            subsample_rng = np.random.default_rng(self.random_state + split_id + 777_777)
+            effective_train_idx = _subsample_train_idx(
+                train_idx,
+                actuals,
+                self.subsample_max_train_size,
+                self.subsample_positive_class_target_perc,
+                subsample_rng,
+            )
+
+        model_values = _model_values(values, feature_type, bin_spec, effective_train_idx)
+        train_X = pd.DataFrame({"feature": model_values[effective_train_idx]})
         validation_X = pd.DataFrame({"feature": model_values[evaluation_idx]})
-        train_y = residuals.iloc[train_idx]
+        train_y = residuals.iloc[effective_train_idx]
         validation_y = residuals.iloc[evaluation_idx]
-        weights_train = _weights_for_fit(sample_weight, train_idx, self.use_sample_weight)
+        weights_train = _weights_for_fit(sample_weight, effective_train_idx, self.use_sample_weight)
         weights_validation = _weights_for_score(
             sample_weight,
             evaluation_idx,
@@ -725,6 +814,20 @@ class ResidualSignalFinderV2:
             weights_validation,
         )
         spearman = _spearman(values.iloc[evaluation_idx], validation_y, feature_type)
+
+        # Variance signal: model on |residuals|
+        abs_train_y = pd.Series(
+            np.abs(train_y.to_numpy()), index=train_y.index, name="abs_residual"
+        )
+        abs_validation_y = np.abs(validation_y.to_numpy())
+        abs_model = self._make_model(
+            self.univariate_model_type, seed=self.random_state + split_id + 999_983
+        )
+        abs_model.fit(train_X, abs_train_y, sample_weight=weights_train)
+        abs_predicted = np.asarray(abs_model.predict(validation_X), dtype=float)
+        abs_train_mean = _weighted_mean(abs_train_y.to_numpy(), weights_train)
+        abs_oof_r2 = _oof_r2(abs_validation_y, abs_predicted, abs_train_mean, weights_validation)
+
         curves = _effect_curve_frame(
             feature_name=feature_name,
             values=values,
@@ -749,6 +852,7 @@ class ResidualSignalFinderV2:
                 "source_feature": source_feature,
                 "is_null": is_null,
                 "oof_r2": oof_r2,
+                "abs_oof_r2": abs_oof_r2,
                 "spearman": spearman,
             },
             curves,
@@ -803,6 +907,35 @@ class ResidualSignalFinderV2:
             percent_positive = (
                 float((spearman_values > 0.0).mean()) if len(spearman_values) else np.nan
             )
+            abs_r2_values = group["abs_oof_r2"].dropna() if "abs_oof_r2" in group.columns else pd.Series(dtype=float)
+            beats_null_values = group["beats_null"].dropna() if "beats_null" in group.columns else pd.Series(dtype=float)
+            oof_r2_vals = group["oof_r2"].dropna()
+            prob_gt0 = float((oof_r2_vals > 0.0).mean()) if len(oof_r2_vals) else np.nan
+            prob_abs_gt0 = float((abs_r2_values > 0.0).mean()) if len(abs_r2_values) else np.nan
+            feature_str = str(feature)
+            bin_spec = self._bin_specs.get(feature_str)
+            bin_stats: dict[str, Any] = (
+                _bin_count_stats(self._X[feature_str], bin_spec)
+                if bin_spec is not None
+                else {"min_bin_n": np.nan, "max_bin_share": np.nan, "sparse_bin_warning": False}
+            )
+            try:
+                curve_for_shape = _feature_curve_summary(validation_curves, feature_str)
+                shape = _classify_residual_shape(
+                    curve_for_shape,
+                    stability=curve_stats["median_effect_curve_spearman_stability"],
+                )
+            except (ValueError, KeyError):
+                shape = "unstable"
+            nbr_for_rec = float(beats_null_values.mean()) if len(beats_null_values) else np.nan
+            category, recommendation = _action_recommendation(
+                mean_oof_r2=float(group["oof_r2"].mean()),
+                prob_signal_gt_zero=prob_gt0,
+                null_beat_rate=nbr_for_rec,
+                stability=curve_stats["median_effect_curve_spearman_stability"],
+                sparse_bin_warning=bool(bin_stats["sparse_bin_warning"]),
+                shape_class=shape,
+            )
             rows.append(
                 {
                     "feature": feature,
@@ -812,6 +945,13 @@ class ResidualSignalFinderV2:
                     "median_oof_residual_r2": float(group["oof_r2"].median()),
                     "p05_oof_residual_r2": _quantile(group["oof_r2"], 0.05),
                     "p95_oof_residual_r2": _quantile(group["oof_r2"], 0.95),
+                    "mean_oof_abs_residual_r2": float(abs_r2_values.mean()) if len(abs_r2_values) else np.nan,
+                    "median_oof_abs_residual_r2": float(abs_r2_values.median()) if len(abs_r2_values) else np.nan,
+                    "p05_oof_abs_residual_r2": _quantile(abs_r2_values, 0.05),
+                    "p95_oof_abs_residual_r2": _quantile(abs_r2_values, 0.95),
+                    "null_beat_rate": float(beats_null_values.mean()) if len(beats_null_values) else np.nan,
+                    "prob_residual_signal_gt_zero": prob_gt0,
+                    "prob_abs_residual_signal_gt_zero": prob_abs_gt0,
                     "mean_residual_signal_rank": float(group["rank"].mean()),
                     "median_residual_signal_rank": float(group["rank"].median()),
                     "mean_feature_residual_spearman": float(spearman_values.mean())
@@ -830,6 +970,12 @@ class ResidualSignalFinderV2:
                     "std_effect_curve_spearman_stability": curve_stats[
                         "std_effect_curve_spearman_stability"
                     ],
+                    "min_bin_n": bin_stats["min_bin_n"],
+                    "max_bin_share": bin_stats["max_bin_share"],
+                    "sparse_bin_warning": bin_stats["sparse_bin_warning"],
+                    "residual_shape_class": shape,
+                    "action_category": category,
+                    "action_recommendation": recommendation,
                 }
             )
 
@@ -852,11 +998,7 @@ class ResidualSignalFinderV2:
         labels = _assign_bins(values, self._bin_specs[feature_name])
         return pd.DataFrame(
             {
-                "bin_label": pd.Categorical(
-                    labels,
-                    categories=self._bin_specs[feature_name].labels,
-                    ordered=True,
-                ),
+                "bin_label": labels.astype(str),
                 "residual": self._residuals.to_numpy(),
                 "abs_residual": np.abs(self._residuals.to_numpy()),
             }
@@ -878,67 +1020,273 @@ class ResidualSignalFinderV2:
             )
         return pd.DataFrame(rows)
 
-    def _plot_null_comparison_on_axis(self, feature_name: str, axis: Any) -> None:
-        real_scores = self.bootstrap_results_.loc[
-            self.bootstrap_results_["feature"] == feature_name,
-            "oof_r2",
-        ]
-        null_scores = self.null_results_["oof_r2"] if not self.null_results_.empty else pd.Series()
-        if not null_scores.empty:
-            axis.hist(null_scores, bins=15, alpha=0.45, label="null", color="lightgray")
-        axis.hist(real_scores, bins=10, alpha=0.65, label=feature_name, color="#4c78a8")
-        axis.axvline(real_scores.mean(), linestyle="-", color="#4c78a8", label="real mean")
-        if not null_scores.empty:
-            axis.axvline(null_scores.quantile(0.95), linestyle=":", color="black", label="null p95")
-        axis.set_title("Null Baseline Comparison: Real Feature vs Shadow Features")
-        axis.set_xlabel("OOF residual R²")
-        axis.legend()
+    def _plot_residual_boxplot_on_axis(
+        self,
+        feature_name: str,
+        axis: Any,
+        retained_bin_labels: list[str],
+        filtered_ec: pd.DataFrame,
+        curve: pd.DataFrame,
+    ) -> None:
+        # Use bootstrap validation mean_residual per bin — consistent with Actual vs Pred panel
+        feature_curves = filtered_ec.loc[filtered_ec["feature"].eq(feature_name)]
+        if "split_role" in feature_curves.columns:
+            feature_curves = feature_curves.loc[feature_curves["split_role"].eq("validation")]
+        label_to_id = {str(row["bin_label"]): row["bin_id"] for _, row in curve.iterrows()}
+        data_by_bin = []
+        for label in retained_bin_labels:
+            bin_id = label_to_id.get(label)
+            if bin_id is not None:
+                vals = feature_curves.loc[
+                    feature_curves["bin_id"].eq(bin_id), "mean_residual"
+                ].dropna().to_numpy(dtype=float)
+            else:
+                vals = np.array([], dtype=float)
+            data_by_bin.append(vals)
+        x = np.arange(len(retained_bin_labels))
+        non_empty = [arr for arr in data_by_bin if len(arr) > 0]
+        if not non_empty:
+            axis.text(0.5, 0.5, "No data available", ha="center", va="center")
+            axis.set_title("Residual Distribution by Feature Bin")
+            return
+        axis.boxplot(
+            data_by_bin,
+            positions=x,
+            widths=0.6,
+            patch_artist=True,
+            showfliers=False,
+            medianprops={"color": "#e05c00", "linewidth": 2.0},
+            boxprops={"facecolor": "#d0e4f5", "alpha": 0.75},
+            whiskerprops={"linewidth": 1.2},
+            capprops={"linewidth": 1.2},
+        )
+        means = [float(arr.mean()) if len(arr) else np.nan for arr in data_by_bin]
+        axis.scatter(x, means, color="#2a6a94", zorder=5, s=30, marker="D", label="mean")
+        axis.axhline(0.0, linestyle=":", color="black", linewidth=1.0)
+        axis.set_title("Residual Distribution by Feature Bin (Bootstrap Validation)")
+        axis.set_ylabel("Mean residual per bootstrap run")
+        axis.legend(loc="best", fontsize=8)
 
-    def _plot_effect_curve_stability_on_axis(self, feature_name: str, axis: Any) -> None:
-        curves = self.effect_curves_.loc[self.effect_curves_["feature"] == feature_name]
+    def _plot_bin_counts_on_axis(
+        self,
+        feature_name: str,
+        axis: Any,
+        bin_labels: list[str],
+        x: np.ndarray[Any, Any],
+    ) -> None:
+        bin_frame = self._full_bin_frame(feature_name)
+        bin_str = bin_frame["bin_label"].astype(str)
+        counts = [int(bin_str.eq(label).sum()) for label in bin_labels]
+        axis.bar(x, counts, color="#8cb8d4", alpha=0.75, width=0.7)
+        axis.set_ylabel("n", fontsize=8)
+        axis.tick_params(axis="y", labelsize=7)
+        axis.set_title("Sample Count per Bin", fontsize=9)
+        if len(bin_labels) <= 8:
+            for xi, n in zip(x, counts):
+                axis.text(float(xi), n * 0.5, str(n), ha="center", va="center", fontsize=7)
+
+    def _plot_partial_residual_on_axis(
+        self,
+        feature_name: str,
+        axis: Any,
+        curve: pd.DataFrame,
+        filtered_ec: pd.DataFrame,
+    ) -> None:
+        import matplotlib.pyplot as plt
+
+        feature_type = _infer_feature_type(self._X[feature_name])
+        residuals = self._residuals
+
+        # Smooth line uses bootstrap validation means from the effect curve (same source as
+        # Actual vs Pred panel) so all bin-level panels are directionally consistent.
+        smooth_y = curve["residual_error_mean"].to_numpy(dtype=float)
+        smooth_ci_low = curve["residual_error_ci_low"].to_numpy(dtype=float)
+        smooth_ci_high = curve["residual_error_ci_high"].to_numpy(dtype=float)
+
+        if feature_type == "continuous":
+            numeric = pd.to_numeric(self._X[feature_name], errors="coerce")
+            valid_mask = numeric.notna() & residuals.notna()
+            # Scatter: full-dataset raw observations for shape context
+            x_all = numeric.loc[valid_mask].to_numpy(dtype=float)
+            y_all = residuals.loc[valid_mask].to_numpy(dtype=float)
+            max_scatter = 2000
+            if len(x_all) > max_scatter:
+                rng_idx = np.random.default_rng(42).choice(len(x_all), size=max_scatter, replace=False)
+                x_scatter = x_all[rng_idx]
+                y_scatter = y_all[rng_idx]
+            else:
+                x_scatter, y_scatter = x_all, y_all
+            axis.scatter(x_scatter, y_scatter, s=8, alpha=0.15, color="#4c78a8", edgecolors="none")
+            # Smooth: compute bin medians for x positions, use bootstrap validation y means
+            bin_spec = self._bin_specs.get(feature_name)
+            if bin_spec is not None:
+                assigned = _assign_bins(self._X[feature_name], bin_spec).astype(str)
+                bin_labels = curve["bin_label"].astype(str).tolist()
+                x_mids: list[float] = []
+                for label in bin_labels:
+                    mask = assigned.eq(label) & valid_mask
+                    x_mids.append(float(numeric.loc[mask].median()) if mask.any() else np.nan)
+                valid_smooth = [
+                    (xm, ym, yl, yh)
+                    for xm, ym, yl, yh in zip(x_mids, smooth_y, smooth_ci_low, smooth_ci_high)
+                    if np.isfinite(xm) and np.isfinite(ym)
+                ]
+                if len(valid_smooth) >= 2:
+                    xs, ys, yls, yhs = zip(*sorted(valid_smooth, key=lambda t: t[0]))
+                    xs_arr = np.array(xs)
+                    axis.fill_between(xs_arr, list(yls), list(yhs), color="#e05c00", alpha=0.20)
+                    axis.plot(
+                        xs_arr, list(ys),
+                        color="#e05c00", linewidth=2.0, marker="o", markersize=4,
+                        label="bin mean (validation)",
+                    )
+                    axis.legend(loc="best", fontsize=8)
+            axis.set_xlabel(feature_name)
+            axis.set_ylabel("Residual (y − base prediction)")
+        else:
+            x_cat = np.arange(len(curve))
+            axis.bar(x_cat, smooth_y, color="#4c78a8", alpha=0.75)
+            axis.fill_between(
+                x_cat, smooth_ci_low, smooth_ci_high, color="#4c78a8", alpha=0.18
+            )
+            axis.set_xticks(x_cat)
+            axis.set_xticklabels(curve["bin_label"].astype(str).tolist())
+            plt.setp(
+                axis.get_xticklabels(),
+                rotation=45,
+                ha="right",
+                rotation_mode="anchor",
+                fontsize=8,
+            )
+            axis.set_xlabel(feature_name)
+            axis.set_ylabel("Mean Residual (y − base prediction)")
+        axis.axhline(0.0, linestyle=":", color="black", linewidth=1.0)
+        axis.set_title(
+            "Partial Residual Plot\n(positive = underprediction, negative = overprediction)",
+            fontsize=9,
+        )
+
+    def _plot_bootstrap_r2_distribution_on_axis(self, feature_name: str, axis: Any) -> None:
+        validation_mask = self.bootstrap_results_["split_role"].eq("validation")
+        feature_mask = self.bootstrap_results_["feature"].eq(feature_name)
+        oof_r2_vals = self.bootstrap_results_.loc[
+            validation_mask & feature_mask, "oof_r2"
+        ].dropna()
+        if oof_r2_vals.empty:
+            axis.text(0.5, 0.5, "No bootstrap data", ha="center", va="center")
+            axis.axis("off")
+            return
+        axis.hist(oof_r2_vals, bins=15, color="#4c78a8", alpha=0.75)
+        mean_r2 = float(oof_r2_vals.mean())
+        axis.axvline(mean_r2, color="black", linewidth=2.0, label=f"mean: {mean_r2:.4f}")
+        axis.axvline(0.0, linestyle=":", color="red", linewidth=1.2, label="zero")
+        prob_gt0 = float((oof_r2_vals > 0.0).mean())
+        axis.text(
+            0.97,
+            0.95,
+            f"P(R²>0): {prob_gt0:.1%}",
+            transform=axis.transAxes,
+            ha="right",
+            va="top",
+            fontsize=9,
+            color="#2a6a94",
+        )
+        axis.set_xlabel("Bootstrap OOF residual R²")
+        axis.set_ylabel("Bootstrap run count")
+        axis.set_title("Bootstrap Residual R² Distribution")
+        axis.legend(loc="upper left", fontsize=8)
+
+    def _plot_null_comparison_on_axis(self, feature_name: str, axis: Any) -> None:
+        validation_mask = self.bootstrap_results_["split_role"].eq("validation")
+        feature_mask = self.bootstrap_results_["feature"].eq(feature_name)
+        real_rows = self.bootstrap_results_.loc[validation_mask & feature_mask]
+        real_scores = real_rows["oof_r2"]
+
+        beats_col = "beats_null" if "beats_null" in real_rows.columns else None
+        beat_rate = float(real_rows[beats_col].mean()) if beats_col and len(real_rows) else np.nan
+
+        if np.isfinite(beat_rate):
+            axis.text(
+                0.5, 0.82,
+                f"{beat_rate:.0%}",
+                transform=axis.transAxes,
+                ha="center", va="center",
+                fontsize=16, fontweight="bold",
+                color="#4a7fa5",
+            )
+            axis.text(
+                0.5, 0.70,
+                "of bootstrap runs beat the null",
+                transform=axis.transAxes,
+                ha="center", va="center",
+                fontsize=9, color="#555555",
+            )
+
+        null_scores: pd.Series = pd.Series(dtype=float)
+        if not self.null_results_.empty and "source_feature" in self.null_results_.columns:
+            null_scores = self.null_results_.loc[
+                self.null_results_["source_feature"].eq(feature_name), "oof_r2"
+            ]
+
+        y_real = np.zeros(len(real_scores)) - 0.06
+        axis.scatter(real_scores, y_real, alpha=0.50, color="#4a7fa5", s=18, zorder=3, label=feature_name)
+        if not null_scores.empty:
+            y_null = np.zeros(len(null_scores)) - 0.14
+            axis.scatter(null_scores, y_null, alpha=0.45, color="#aaaaaa", s=18, zorder=2, label="null")
+            axis.axvline(float(null_scores.median()), linestyle="--", color="#888", linewidth=1.2, label="null p50")
+            axis.axvline(float(null_scores.quantile(0.95)), linestyle=":", color="#333", linewidth=1.2, label="null p95")
+        if len(real_scores):
+            axis.axvline(float(real_scores.mean()), linestyle="-", color="#4a7fa5", linewidth=1.5, label="real mean")
+        axis.set_yticks([])
+        axis.set_title(f"Null Baseline Comparison: {feature_name}")
+        axis.set_xlabel("OOF residual R²")
+        axis.legend(loc="lower right", fontsize=8)
+
+    def _plot_effect_curve_stability_on_axis(
+        self,
+        feature_name: str,
+        axis: Any,
+        effect_curves: pd.DataFrame | None = None,
+    ) -> None:
+        ec = effect_curves if effect_curves is not None else self.effect_curves_
+        curves = ec.loc[ec["feature"] == feature_name]
         if curves.empty:
             axis.text(0.5, 0.5, "No effect curves available", ha="center", va="center")
             axis.axis("off")
             return
 
-        curve_matrix = _effect_curve_matrix(self.effect_curves_, feature_name)
-        curve_summary = _feature_curve_summary(self.effect_curves_, feature_name)
+        curve_summary = _feature_curve_summary(ec, feature_name)
         x = np.arange(len(curve_summary))
-        for bootstrap_id, row in curve_matrix.iterrows():
-            axis.plot(
-                x,
-                row.reindex(curve_summary["bin_id"]).to_numpy(dtype=float),
-                color="darkgray",
-                linewidth=0.9,
-                alpha=0.75,
-                label="bootstrap runs" if bootstrap_id == curve_matrix.index[0] else None,
-            )
+        reliable = curve_summary["pct_reliable"].to_numpy(dtype=float) >= 0.50
+
+        # Continuous CI band; mask values for unreliable bins so they don't appear
+        p025 = curve_summary["centered_residual_p025"].to_numpy(dtype=float).copy()
+        p975 = curve_summary["centered_residual_p975"].to_numpy(dtype=float).copy()
+        p025[~reliable] = np.nan
+        p975[~reliable] = np.nan
+        axis.fill_between(x, p025, p975, color="#4a7fa5", alpha=0.22, label="95% CI")
+
         axis.plot(
             x,
-            curve_summary["centered_mean_residual"],
-            color="black",
-            linewidth=2.2,
+            curve_summary["centered_mean_residual"].to_numpy(dtype=float),
+            color="#4a7fa5",
+            linewidth=2.0,
             marker="o",
-            label="mean error",
-        )
-        axis.fill_between(
-            x,
-            curve_summary["centered_residual_p05"].to_numpy(dtype=float),
-            curve_summary["centered_residual_p95"].to_numpy(dtype=float),
-            color="black",
-            alpha=0.14,
-            label="5p to 95p bootstrap band",
+            markersize=5,
+            label="mean",
         )
         axis.axhline(0.0, linestyle=":", color="black", linewidth=1.0)
-        axis.set_title(
-            "Prediction Error by Feature Bin Across Bootstrap Runs "
-            "(Actual - Base Prediction)"
-        )
+        axis.set_title("Prediction Error by Feature Bin (Bootstrap 95% CI)")
         axis.set_ylabel("Centered mean residual")
         axis.legend(loc="best")
 
     def _plot_effect_curve_correlation_on_axis(self, feature_name: str, axis: Any) -> None:
         correlations = _effect_curve_pairwise_spearman(self.effect_curves_, feature_name)
+        axis.set_title(
+            f"{feature_name}: Spearman Rank Correlation Between Effect Curves\n"
+            "(consistency of residual effect across bootstrap samples)",
+            fontsize=10,
+        )
         if correlations.empty:
             axis.text(
                 0.5,
@@ -951,21 +1299,12 @@ class ResidualSignalFinderV2:
             return
         axis.hist(correlations, bins=15, color="#4c78a8", alpha=0.75)
         mean_value = float(correlations.mean())
-        median_value = float(correlations.median())
         axis.axvline(
             mean_value,
             color="black",
             linewidth=2.0,
             label=f"mean Spearman: {mean_value:.2f}",
         )
-        axis.axvline(
-            median_value,
-            color="darkgray",
-            linestyle="--",
-            linewidth=2.0,
-            label=f"median Spearman: {median_value:.2f}",
-        )
-        axis.set_title(f"{feature_name}: Spearman Rank Correlation Between Effect Curves")
         axis.set_xlabel("Pairwise bootstrap curve Spearman correlation")
         axis.set_ylabel("Bootstrap-pair count")
         axis.legend(loc="best")
@@ -1364,8 +1703,8 @@ def _balanced_bin_label(bin_id: int, left: float, right: float) -> str:
     left_label = _format_bin_value(left)
     right_label = _format_bin_value(right)
     if left == right:
-        return f"Bin {bin_id}: {left_label}"
-    return f"Bin {bin_id}: {left_label} to {right_label}"
+        return left_label
+    return f"{left_label}–{right_label}"
 
 
 def _format_bin_value(value: float) -> str:
@@ -1402,9 +1741,12 @@ def _set_discrete_axis_labels(
     if len(ticks) > max_labels:
         step = int(np.ceil(len(ticks) / max_labels))
         ticks = pd.concat([ticks.iloc[::step], ticks.tail(1)]).drop_duplicates("x_value")
+    import matplotlib.pyplot as plt
+
     axis.set_xticks(ticks["x_value"])
-    axis.set_xticklabels(ticks["x_label"], rotation=35, ha="right")
+    axis.set_xticklabels(ticks["x_label"])
     axis.tick_params(axis="x", labelsize=8)
+    plt.setp(axis.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
 
 
 def _categorical_labels(values: pd.Series, finder: ResidualSignalFinderV2) -> list[str]:
@@ -1692,17 +2034,23 @@ def _null_curve_stability(null_effect_curves: pd.DataFrame) -> pd.DataFrame:
 
 
 def _add_null_comparison(results: pd.DataFrame, null_results: pd.DataFrame) -> pd.DataFrame:
+    """Match each real feature to its specific permuted null by source_feature + split."""
     if results.empty:
         return results
     compared = results.copy()
-    if null_results.empty:
-        compared["null_95_score"] = np.nan
-        compared["beats_null_95"] = False
+    if null_results.empty or "source_feature" not in null_results.columns:
+        compared["null_oof_r2"] = np.nan
+        compared["beats_null"] = np.nan
         return compared
-    null_95 = null_results.groupby(["bootstrap_id", "split_role"])["oof_r2"].quantile(0.95)
-    null_lookup = pd.MultiIndex.from_frame(compared[["bootstrap_id", "split_role"]])
-    compared["null_95_score"] = null_95.reindex(null_lookup).to_numpy()
-    compared["beats_null_95"] = compared["oof_r2"] > compared["null_95_score"]
+    null_lookup = (
+        null_results[["source_feature", "split_id", "split_role", "oof_r2"]]
+        .rename(columns={"source_feature": "feature", "oof_r2": "null_oof_r2"})
+    )
+    compared = compared.merge(null_lookup, on=["feature", "split_id", "split_role"], how="left")
+    has_null = compared["null_oof_r2"].notna()
+    compared["beats_null"] = np.where(
+        has_null, compared["oof_r2"] > compared["null_oof_r2"], np.nan
+    )
     return compared
 
 
@@ -1784,7 +2132,21 @@ def _effect_curve_matrix(effect_curves: pd.DataFrame, feature: str) -> pd.DataFr
 
 
 def _effect_curve_pairwise_spearman(effect_curves: pd.DataFrame, feature: str) -> pd.Series:
-    pivot = _effect_curve_matrix(effect_curves, feature)
+    feature_curves = effect_curves.loc[effect_curves["feature"] == feature].copy()
+    if "split_role" in feature_curves.columns:
+        feature_curves = feature_curves.loc[feature_curves["split_role"].eq("validation")]
+    if feature_curves.empty:
+        return pd.Series(dtype=float)
+    # Keep only bins that are reliable in at least 50% of bootstrap runs
+    if "reliable" in feature_curves.columns:
+        bin_reliability = feature_curves.groupby("bin_id")["reliable"].mean()
+        reliable_bin_ids = set(bin_reliability.index[bin_reliability >= 0.5])
+        feature_curves = feature_curves[feature_curves["bin_id"].isin(reliable_bin_ids)]
+    if feature_curves.empty or feature_curves["bin_id"].nunique() < 3:
+        return pd.Series(dtype=float)
+    pivot = feature_curves.pivot(
+        index="bootstrap_id", columns="bin_id", values="centered_mean_residual"
+    )
     if pivot.empty:
         return pd.Series(dtype=float)
     vectors = [row.to_numpy(dtype=float) for _idx, row in pivot.iterrows()]
@@ -1806,6 +2168,150 @@ def _spearman_array(left: np.ndarray[Any, Any], right: np.ndarray[Any, Any]) -> 
         return np.nan
     value = left_valid.corr(right_valid, method="spearman")
     return float(value) if pd.notna(value) else np.nan
+
+
+def _drop_degenerate_bins(effect_curves: pd.DataFrame, feature_name: str) -> pd.DataFrame:
+    """Remove point-mass bins (bin_left == bin_right) for a feature from effect_curves.
+
+    When a continuous feature has many repeated values the quantile-based binning
+    can create bins whose left and right boundary are identical — these add no
+    shape information to the effect curve.  Removing them keeps both panels
+    aligned and avoids a flat segment that spans a single value.
+    """
+    if "bin_left" not in effect_curves.columns or "bin_right" not in effect_curves.columns:
+        return effect_curves
+    feature_mask = effect_curves["feature"] == feature_name
+    feature_ec = effect_curves.loc[feature_mask]
+    if feature_ec.empty:
+        return effect_curves
+    # A bin is degenerate when bin_left == bin_right (both non-NaN) across >50% of runs
+    bin_degenerate = feature_ec.groupby("bin_id")[["bin_left", "bin_right"]].apply(
+        lambda g: (
+            g["bin_left"].notna() & g["bin_right"].notna() & (g["bin_left"] == g["bin_right"])
+        ).mean()
+        > 0.50
+    )
+    degenerate_ids = set(bin_degenerate.index[bin_degenerate])
+    if not degenerate_ids:
+        return effect_curves
+    drop_mask = feature_mask & effect_curves["bin_id"].isin(degenerate_ids)
+    return effect_curves.loc[~drop_mask].reset_index(drop=True)
+
+
+def _bin_count_stats(
+    feature_values: pd.Series, bin_spec: _BinSpec
+) -> dict[str, Any]:
+    labels = _assign_bins(feature_values, bin_spec).astype(str)
+    counts = labels.value_counts()
+    non_missing = counts.drop("__MISSING__", errors="ignore")
+    if non_missing.empty:
+        return {"min_bin_n": 0, "max_bin_share": 1.0, "sparse_bin_warning": True}
+    total = int(non_missing.sum())
+    min_n = int(non_missing.min())
+    max_share = float(non_missing.max() / total) if total > 0 else 1.0
+    return {
+        "min_bin_n": min_n,
+        "max_bin_share": max_share,
+        "sparse_bin_warning": min_n < 30 or max_share > 0.50,
+    }
+
+
+def _classify_residual_shape(
+    curve: pd.DataFrame,
+    stability: float,
+    stability_threshold: float = 0.40,
+    flat_threshold: float = 0.001,
+) -> str:
+    if not np.isfinite(stability) or stability < stability_threshold:
+        return "unstable"
+    centered = curve["centered_mean_residual"].to_numpy(dtype=float)
+    finite = centered[np.isfinite(centered)]
+    if len(finite) < 3:
+        return "unstable"
+    overall_range = float(np.max(finite) - np.min(finite))
+    if overall_range < flat_threshold:
+        return "flat_or_noisy"
+    diffs = np.diff(finite)
+    pct_positive = float(np.mean(diffs > 0))
+    pct_negative = float(np.mean(diffs < 0))
+    n = len(finite)
+    mid_start = n // 4
+    mid_end = 3 * n // 4
+    midpoint = float(
+        np.mean(finite[mid_start : mid_end + 1]) if mid_start < mid_end else finite[n // 2]
+    )
+    edge_mean = (finite[0] + finite[-1]) / 2.0
+    mid_vs_edge = midpoint - edge_mean
+    if pct_positive >= 0.75:
+        return "monotonic_increasing"
+    if pct_negative >= 0.75:
+        return "monotonic_decreasing"
+    if mid_vs_edge < -overall_range * 0.30:
+        return "u_shaped"
+    if mid_vs_edge > overall_range * 0.30:
+        return "inverted_u_shaped"
+    return "nonlinear_or_threshold"
+
+
+def _action_recommendation(
+    *,
+    mean_oof_r2: float,
+    prob_signal_gt_zero: float,
+    null_beat_rate: float,
+    stability: float,
+    sparse_bin_warning: bool,
+    shape_class: str,
+    strong_r2_threshold: float = 0.01,
+    moderate_r2_threshold: float = 0.005,
+    prob_signal_threshold: float = 0.90,
+    moderate_prob_threshold: float = 0.75,
+    stability_threshold: float = 0.60,
+    moderate_stability_threshold: float = 0.40,
+    null_beat_threshold: float = 0.80,
+) -> tuple[str, str]:
+    def _s(v: float) -> float:
+        return float(v) if np.isfinite(v) else 0.0
+
+    r2 = _s(mean_oof_r2)
+    prob = _s(prob_signal_gt_zero)
+    nbr = _s(null_beat_rate)
+    stab = _s(stability)
+    strong = (
+        r2 >= strong_r2_threshold
+        and prob >= prob_signal_threshold
+        and nbr >= null_beat_threshold
+        and stab >= stability_threshold
+    )
+    moderate = not strong and (
+        r2 >= moderate_r2_threshold
+        and prob >= moderate_prob_threshold
+        and stab >= moderate_stability_threshold
+    )
+    if strong:
+        category = "strong"
+        base_text = (
+            "Strong candidate for re-specification. The feature shows stable residual signal "
+            "and should be tested with a more flexible form."
+        )
+    elif moderate:
+        category = "moderate"
+        base_text = (
+            "Moderate residual signal. Investigate this feature, but validate improvement "
+            "before prioritizing production changes."
+        )
+    else:
+        category = "weak"
+        base_text = (
+            "Weak or unstable residual signal. Do not prioritize this feature unless there "
+            "is strong business rationale."
+        )
+    sparse_note = (
+        " Residual pattern may be driven by sparse bins — validate with larger samples "
+        "or grouped bins before acting."
+        if sparse_bin_warning
+        else ""
+    )
+    return category, base_text + sparse_note
 
 
 def _feature_curve_summary(effect_curves: pd.DataFrame, feature_name: str) -> pd.DataFrame:
@@ -1831,11 +2337,14 @@ def _feature_curve_summary(effect_curves: pd.DataFrame, feature_name: str) -> pd
                 "residual_error_mean": group["mean_residual"].mean(),
                 "residual_error_ci_low": group["mean_residual"].quantile(0.025),
                 "residual_error_ci_high": group["mean_residual"].quantile(0.975),
+                "pct_reliable": float(group["reliable"].mean()) if "reliable" in group.columns else 1.0,
                 "centered_mean_residual": group["centered_mean_residual"].mean(),
+                "centered_residual_p025": group["centered_mean_residual"].quantile(0.025),
                 "centered_residual_p05": group["centered_mean_residual"].quantile(0.05),
                 "centered_residual_p10": group["centered_mean_residual"].quantile(0.10),
                 "centered_residual_p90": group["centered_mean_residual"].quantile(0.90),
                 "centered_residual_p95": group["centered_mean_residual"].quantile(0.95),
+                "centered_residual_p975": group["centered_mean_residual"].quantile(0.975),
                 "predicted_residual": group["predicted_residual"].mean(),
                 "predicted_residual_p10": group["predicted_residual"].quantile(0.10),
                 "predicted_residual_p90": group["predicted_residual"].quantile(0.90),
@@ -1853,3 +2362,248 @@ def _quantile(values: pd.Series, q: float) -> float:
 def _require_fitted(table: pd.DataFrame, attribute: str) -> None:
     if table.empty:
         raise ValueError(f"{attribute} is empty; call fit before requesting diagnostics")
+
+
+def _warn_large_dataset(
+    n_obs: int,
+    n_features: int,
+    finder: ResidualSignalFinderV2,
+) -> list[str]:
+    messages = []
+    if n_obs > 100_000:
+        suggested_bootstraps = max(30, min(finder.n_bootstraps, 5_000_000 // n_obs))
+        if suggested_bootstraps < finder.n_bootstraps:
+            messages.append(
+                f"Large dataset detected (n={n_obs:,}). With {n_obs:,} observations each "
+                f"validation fold has ~{int(n_obs * finder.test_size):,} rows, providing "
+                f"stable OOF estimates. Consider reducing n_bootstraps from "
+                f"{finder.n_bootstraps} to {suggested_bootstraps} to reduce runtime."
+            )
+        if finder.subsample_max_train_size is None:
+            messages.append(
+                f"Large dataset (n={n_obs:,}): set subsample_max_train_size to cap per-split "
+                f"training size for faster univariate fits without losing stability."
+            )
+    if n_features > 30:
+        messages.append(
+            f"Many features ({n_features}): screening_enabled=True with screening_top_k="
+            f"{finder.screening_top_k} is recommended to reduce the candidate set before "
+            f"the univariate loop."
+        )
+    for msg in messages:
+        warnings.warn(msg, UserWarning, stacklevel=4)
+    return messages
+
+
+def _subsample_train_idx(
+    train_idx: np.ndarray[Any, Any],
+    actuals: pd.Series,
+    max_size: int,
+    positive_class_target_perc: float,
+    rng: np.random.Generator,
+) -> np.ndarray[Any, Any]:
+    """Subsample training indices, upsampling non-zeros for zero-inflated targets."""
+    if len(train_idx) <= max_size:
+        return train_idx
+    train_y = actuals.iloc[train_idx].to_numpy(dtype=float)
+    zero_rate = float(np.mean(train_y == 0.0))
+    if zero_rate > 0.80:
+        zero_positions = train_idx[train_y == 0.0]
+        nonzero_positions = train_idx[train_y != 0.0]
+        n_nonzero_target = max(1, int(round(max_size * positive_class_target_perc)))
+        n_zero_target = max(0, max_size - n_nonzero_target)
+        sampled_zeros = rng.choice(
+            zero_positions, size=min(n_zero_target, len(zero_positions)), replace=False
+        )
+        replace_nonzero = len(nonzero_positions) < n_nonzero_target
+        sampled_nonzeros = rng.choice(
+            nonzero_positions, size=n_nonzero_target, replace=replace_nonzero
+        )
+        return np.sort(np.concatenate([sampled_zeros, sampled_nonzeros]))
+    return np.sort(rng.choice(train_idx, size=max_size, replace=False))
+
+
+def _make_composite_segment(features: pd.DataFrame, segment_cols: list[str]) -> pd.Series:
+    """Combine multiple segment columns into a single composite key."""
+    if len(segment_cols) == 1:
+        return features[segment_cols[0]].astype(str)
+    return features[segment_cols].astype(str).agg("__".join, axis=1)
+
+
+def _stratified_bootstrap_split(
+    positions: np.ndarray[Any, Any],
+    segment_values: pd.Series,
+    train_size: int,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray[Any, Any], np.ndarray[Any, Any]]:
+    """Bootstrap split that preserves segment proportions."""
+    seg_array = segment_values.to_numpy()
+    unique_segments = np.unique(seg_array)
+    train_parts: list[np.ndarray[Any, Any]] = []
+    val_parts: list[np.ndarray[Any, Any]] = []
+    for segment in unique_segments:
+        seg_positions = positions[seg_array == segment]
+        seg_n = len(seg_positions)
+        seg_train_size = max(1, int(round(train_size * seg_n / len(positions))))
+        seg_train = rng.choice(seg_positions, size=min(seg_train_size, seg_n), replace=False)
+        seg_val = np.setdiff1d(seg_positions, seg_train)
+        train_parts.append(seg_train)
+        if len(seg_val) > 0:
+            val_parts.append(seg_val)
+    return np.sort(np.concatenate(train_parts)), np.sort(np.concatenate(val_parts))
+
+
+def _figure_to_base64(fig: Any) -> str:
+    """Serialize a matplotlib figure to a base64-encoded PNG string."""
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=120)
+    buf.seek(0)
+    return base64.b64encode(buf.read()).decode("utf-8")
+
+
+def _build_html_report(
+    title: str,
+    generated_at: str,
+    exec_items: list[tuple[str, str]],
+    ranking_df: pd.DataFrame,
+    feature_figures: list[tuple[str, str | None]],
+    top_n: int,
+    warning_messages: list[str],
+) -> str:
+    css = """
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      font-size: 14px; line-height: 1.65; color: #222; background: #fff;
+      max-width: 1100px; margin: 0 auto; padding: 44px 36px;
+    }
+    .report-header { border-top: 3px solid #4a7fa5; padding-top: 22px; margin-bottom: 40px; }
+    h1 { font-size: 22px; font-weight: 600; color: #1a1a1a; margin-bottom: 4px; }
+    .meta { font-size: 12px; color: #999; }
+    h2 {
+      font-size: 12px; font-weight: 700; color: #4a7fa5;
+      text-transform: uppercase; letter-spacing: 0.07em;
+      margin-top: 44px; margin-bottom: 16px;
+      padding-bottom: 7px; border-bottom: 1px solid #e4e4e4;
+    }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th {
+      text-align: left; font-weight: 600; color: #666;
+      padding: 9px 13px; border-bottom: 2px solid #e4e4e4; white-space: nowrap;
+    }
+    td { padding: 8px 13px; border-bottom: 1px solid #f2f2f2; vertical-align: top; }
+    tr:nth-child(even) td { background: #f9fafb; }
+    td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    .badge {
+      display: inline-block; padding: 2px 8px; border-radius: 3px;
+      font-size: 11px; font-weight: 700; letter-spacing: 0.02em;
+    }
+    .badge-strong { background: #ddeef7; color: #2a6a94; }
+    .badge-moderate { background: #e6f4e6; color: #3a7a3a; }
+    .badge-weak { background: #f0f0f0; color: #999; }
+    .feature-card { margin-top: 36px; padding-top: 24px; border-top: 1px solid #e8e8e8; }
+    .feature-card h3 { font-size: 15px; font-weight: 600; color: #1a1a1a; margin-bottom: 12px; }
+    .feature-card img { max-width: 100%; height: auto; }
+    .warnings {
+      background: #fffbf0; border-left: 3px solid #f0a500;
+      padding: 14px 18px; margin-top: 36px; font-size: 13px; color: #555;
+    }
+    .warnings ul { margin: 8px 0 0 18px; }
+    .warnings li { margin-bottom: 4px; }
+    """
+
+    exec_rows = "".join(
+        f"<tr><td>{_html.escape(k)}</td><td class='num'>{_html.escape(v)}</td></tr>"
+        for k, v in exec_items
+    )
+
+    col_labels = {
+        "feature": "Feature",
+        "feature_type": "Type",
+        "mean_oof_residual_r2": "Mean OOF R²",
+        "null_beat_rate": "Null Beat Rate",
+        "median_effect_curve_spearman_stability": "Curve Stability",
+        "mean_oof_abs_residual_r2": "Variance Signal R²",
+        "pct_positive_feature_residual_spearman": "% Positive Spearman",
+    }
+    header_cells = "".join(
+        f"<th>{col_labels.get(c, c)}</th>" for c in ranking_df.columns
+    )
+    ranking_rows = []
+    for _, row in ranking_df.iterrows():
+        cells = []
+        for col in ranking_df.columns:
+            val = str(row[col]) if pd.notna(row[col]) else ""
+            if col == "null_beat_rate" and val:
+                try:
+                    rate = float(val)
+                    if rate > 0.75:
+                        badge_cls = "badge-strong"
+                    elif rate >= 0.50:
+                        badge_cls = "badge-moderate"
+                    else:
+                        badge_cls = "badge-weak"
+                    val = f"<span class='badge {badge_cls}'>{rate:.0%}</span>"
+                    cells.append(f"<td>{val}</td>")
+                    continue
+                except ValueError:
+                    pass
+            numeric_cols = {
+                "mean_oof_residual_r2", "median_effect_curve_spearman_stability",
+                "mean_oof_abs_residual_r2", "pct_positive_feature_residual_spearman",
+            }
+            td_class = " class='num'" if col in numeric_cols else ""
+            cells.append(f"<td{td_class}>{_html.escape(val)}</td>")
+        ranking_rows.append(f"<tr>{''.join(cells)}</tr>")
+
+    feature_cards_html = ""
+    for feature_name, img_b64 in feature_figures:
+        img_tag = (
+            f"<img src='data:image/png;base64,{img_b64}' alt='{_html.escape(feature_name)}'>"
+            if img_b64
+            else "<p><em>Figure unavailable.</em></p>"
+        )
+        feature_cards_html += (
+            f"<div class='feature-card'>"
+            f"<h3>{_html.escape(feature_name)}</h3>"
+            f"{img_tag}"
+            f"</div>"
+        )
+
+    warnings_html = ""
+    if warning_messages:
+        items = "".join(f"<li>{_html.escape(w)}</li>" for w in warning_messages)
+        warnings_html = f"<div class='warnings'><strong>Warnings</strong><ul>{items}</ul></div>"
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{_html.escape(title)}</title>
+  <style>{css}</style>
+</head>
+<body>
+  <div class="report-header">
+    <h1>{_html.escape(title)}</h1>
+    <p class="meta">Generated {_html.escape(generated_at)}</p>
+  </div>
+
+  <h2>Residual Health</h2>
+  <table>
+    <thead><tr><th>Metric</th><th>Value</th></tr></thead>
+    <tbody>{exec_rows}</tbody>
+  </table>
+
+  <h2>Feature Rankings — Top {top_n}</h2>
+  <table>
+    <thead><tr>{header_cells}</tr></thead>
+    <tbody>{''.join(ranking_rows)}</tbody>
+  </table>
+
+  <h2>Feature Diagnostics</h2>
+  {feature_cards_html}
+
+  {warnings_html}
+</body>
+</html>"""

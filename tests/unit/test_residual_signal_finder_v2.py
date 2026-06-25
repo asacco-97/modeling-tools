@@ -19,7 +19,7 @@ def make_v2_finder(**overrides: object) -> ResidualSignalFinderV2:
         "n_bootstraps": 5,
         "test_size": 0.25,
         "n_bins": 5,
-        "n_null_features": 3,
+
         "univariate_model_type": "random_forest",
         "random_state": 42,
         "use_sample_weight": True,
@@ -61,6 +61,13 @@ def test_v2_basic_fit_returns_primary_summary_columns() -> None:
         "median_oof_residual_r2",
         "p05_oof_residual_r2",
         "p95_oof_residual_r2",
+        "mean_oof_abs_residual_r2",
+        "median_oof_abs_residual_r2",
+        "p05_oof_abs_residual_r2",
+        "p95_oof_abs_residual_r2",
+        "null_beat_rate",
+        "prob_residual_signal_gt_zero",
+        "prob_abs_residual_signal_gt_zero",
         "mean_residual_signal_rank",
         "median_residual_signal_rank",
         "mean_feature_residual_spearman",
@@ -69,6 +76,12 @@ def test_v2_basic_fit_returns_primary_summary_columns() -> None:
         "mean_effect_curve_spearman_stability",
         "median_effect_curve_spearman_stability",
         "std_effect_curve_spearman_stability",
+        "min_bin_n",
+        "max_bin_share",
+        "sparse_bin_warning",
+        "residual_shape_class",
+        "action_category",
+        "action_recommendation",
     }
     assert set(summary.columns) == expected_columns
     assert "x1" in summary.head(2)["feature"].tolist()
@@ -86,12 +99,13 @@ def test_v2_bootstrap_and_null_outputs_have_expected_columns() -> None:
         "bootstrap_id",
         "feature",
         "oof_r2",
+        "abs_oof_r2",
         "rank",
         "spearman",
         "is_top_5",
         "is_top_10",
-        "null_95_score",
-        "beats_null_95",
+        "null_oof_r2",
+        "beats_null",
     }.issubset(finder.bootstrap_results_.columns)
     assert {
         "bootstrap_id",
@@ -120,7 +134,6 @@ def test_v2_custom_splits_and_screening_work() -> None:
         screening_n_repeats=1,
         split_strategy="bootstrap",
         n_bootstraps=1,
-        n_null_features=2,
         model_params={"n_estimators": 15, "max_depth": 3, "min_samples_leaf": 5},
     )
 
@@ -212,31 +225,22 @@ def test_v2_plot_methods_return_figures() -> None:
 
     diagnostics = finder.plot_feature_diagnostics(top_feature)
     assert isinstance(diagnostics, Figure)
-    assert isinstance(finder.plot_effect_curve(top_feature), Figure)
-    assert isinstance(finder.plot_null_comparison(top_feature), Figure)
     assert isinstance(finder.plot_rank_stability(n=3), Figure)
     assert isinstance(finder.plot_residual_signal_map(), Figure)
     assert len(diagnostics.axes) == 5
     assert diagnostics.axes[0].get_title() == (
         "Actual vs. Base Prediction by Feature Bin (Bootstrap CI)"
     )
-    assert diagnostics.axes[1].get_title() == (
-        "Prediction Error by Feature Bin Across Bootstrap Runs "
-        "(Actual - Base Prediction)"
-    )
-    assert diagnostics.axes[1].get_legend() is not None
-    assert diagnostics.axes[2].get_title() == (
-        f"{top_feature}: Spearman Rank Correlation Between Effect Curves"
-    )
-    assert diagnostics.axes[3].get_title() == (
-        "Null Baseline Comparison: Real Feature vs Shadow Features"
-    )
+    assert diagnostics.axes[1].get_title() == "Residual Distribution by Feature Bin (Bootstrap Validation)"
+    assert diagnostics.axes[2].get_title() == "Sample Count per Bin"
+    assert "Partial Residual Plot" in diagnostics.axes[3].get_title()
+    assert diagnostics.axes[4].get_title() == "Bootstrap Residual R² Distribution"
     top_figures = finder.plot_top_features(n=2)
     assert len(top_figures) == 2
     assert all(isinstance(figure, Figure) for figure in top_figures.values())
 
 
-def test_v2_classification_diagnostics_use_binned_residual_scatter() -> None:
+def test_v2_classification_diagnostics_produce_four_panel_figure() -> None:
     X, y_true, y_pred, _sample_weight, _split_col = make_v2_data()
     binary_target = (y_true > y_true.median()).astype(float)
     base_probability = pd.Series(
@@ -253,8 +257,7 @@ def test_v2_classification_diagnostics_use_binned_residual_scatter() -> None:
 
     diagnostics = finder.plot_feature_diagnostics(top_feature)
 
-    assert diagnostics.axes[4].get_title() == "Classification Residual Scatter by Feature Bins"
-    assert diagnostics.axes[4].get_xticklabels()
+    assert len(diagnostics.axes) == 5
 
 
 def test_v2_discrete_numeric_bins_never_emit_zero_observation_rows() -> None:
@@ -267,7 +270,7 @@ def test_v2_discrete_numeric_bins_never_emit_zero_observation_rows() -> None:
             p=[0.12, 0.20, 0.38, 0.12, 0.06, 0.03, 0.03, 0.02, 0.02, 0.01, 0.01],
         )
     )
-    finder = make_v2_finder(n_bins=5, n_null_features=1).fit(
+    finder = make_v2_finder(n_bins=5).fit(
         X.loc[:, ["pay_0"]],
         y=y_true,
         base_pred=y_pred,
@@ -278,7 +281,7 @@ def test_v2_discrete_numeric_bins_never_emit_zero_observation_rows() -> None:
     assert not pay_curves.empty
     assert pay_curves["n_obs"].min() > 0
     assert not pay_curves["centered_mean_residual"].isna().any()
-    assert all(str(label).startswith("Bin ") for label in pay_curves["bin_label"].unique())
+    assert all("–" in str(label) or str(label).lstrip("-").replace(".", "", 1).isdigit() for label in pay_curves["bin_label"].unique())
 
 
 def test_v2_weighted_bins_have_positive_and_balanced_weight() -> None:
@@ -293,3 +296,113 @@ def test_v2_weighted_bins_have_positive_and_balanced_weight() -> None:
     assert len(bin_weight) == 4
     assert bin_weight.min() > 0
     assert bin_weight.max() - bin_weight.min() <= weights.max() * 1.25
+
+
+def test_v2_summary_includes_new_diagnostic_metrics() -> None:
+    X, y_true, y_pred, sample_weight, _split_col = make_v2_data()
+    finder = make_v2_finder().fit(X, y=y_true, base_pred=y_pred, sample_weight=sample_weight)
+    summary = finder.get_summary()
+
+    new_cols = [
+        "prob_residual_signal_gt_zero",
+        "prob_abs_residual_signal_gt_zero",
+        "min_bin_n",
+        "max_bin_share",
+        "sparse_bin_warning",
+        "residual_shape_class",
+        "action_category",
+        "action_recommendation",
+    ]
+    for col in new_cols:
+        assert col in summary.columns, f"Missing column: {col}"
+
+    assert summary["prob_residual_signal_gt_zero"].between(0.0, 1.0, inclusive="both").all()
+    assert summary["prob_abs_residual_signal_gt_zero"].between(0.0, 1.0, inclusive="both").all()
+    assert summary["min_bin_n"].gt(0).all()
+    assert summary["residual_shape_class"].notna().all()
+    assert summary["action_category"].isin({"strong", "moderate", "weak"}).all()
+    assert summary["action_recommendation"].notna().all()
+
+
+def test_v2_classify_residual_shape_monotonic_increasing() -> None:
+    from pe_tools.signal_finder.v2 import _classify_residual_shape
+
+    curve = pd.DataFrame({
+        "centered_mean_residual": [-0.3, -0.1, 0.1, 0.3, 0.5],
+        "bin_label": list("abcde"),
+    })
+    assert _classify_residual_shape(curve, stability=0.80) == "monotonic_increasing"
+
+
+def test_v2_classify_residual_shape_monotonic_decreasing() -> None:
+    from pe_tools.signal_finder.v2 import _classify_residual_shape
+
+    curve = pd.DataFrame({
+        "centered_mean_residual": [0.5, 0.3, 0.1, -0.1, -0.3],
+        "bin_label": list("abcde"),
+    })
+    assert _classify_residual_shape(curve, stability=0.80) == "monotonic_decreasing"
+
+
+def test_v2_classify_residual_shape_unstable_when_low_stability() -> None:
+    from pe_tools.signal_finder.v2 import _classify_residual_shape
+
+    curve = pd.DataFrame({
+        "centered_mean_residual": [-0.3, 0.4, -0.2, 0.3, -0.1],
+        "bin_label": list("abcde"),
+    })
+    assert _classify_residual_shape(curve, stability=0.15) == "unstable"
+
+
+def test_v2_classify_residual_shape_flat_or_noisy() -> None:
+    from pe_tools.signal_finder.v2 import _classify_residual_shape
+
+    curve = pd.DataFrame({
+        "centered_mean_residual": [0.0001, -0.0001, 0.0002, -0.0001, 0.0],
+        "bin_label": list("abcde"),
+    })
+    assert _classify_residual_shape(curve, stability=0.80) == "flat_or_noisy"
+
+
+def test_v2_action_recommendation_strong_signal() -> None:
+    from pe_tools.signal_finder.v2 import _action_recommendation
+
+    category, text = _action_recommendation(
+        mean_oof_r2=0.05,
+        prob_signal_gt_zero=0.95,
+        null_beat_rate=0.90,
+        stability=0.75,
+        sparse_bin_warning=False,
+        shape_class="monotonic_increasing",
+    )
+    assert category == "strong"
+    assert "re-specification" in text
+
+
+def test_v2_action_recommendation_weak_signal() -> None:
+    from pe_tools.signal_finder.v2 import _action_recommendation
+
+    category, text = _action_recommendation(
+        mean_oof_r2=0.001,
+        prob_signal_gt_zero=0.55,
+        null_beat_rate=0.50,
+        stability=0.30,
+        sparse_bin_warning=False,
+        shape_class="flat_or_noisy",
+    )
+    assert category == "weak"
+    assert "sparse bins" not in text
+
+
+def test_v2_action_recommendation_appends_sparse_warning() -> None:
+    from pe_tools.signal_finder.v2 import _action_recommendation
+
+    _cat, text = _action_recommendation(
+        mean_oof_r2=0.001,
+        prob_signal_gt_zero=0.60,
+        null_beat_rate=0.55,
+        stability=0.30,
+        sparse_bin_warning=True,
+        shape_class="flat_or_noisy",
+    )
+    assert "sparse bins" in text
