@@ -96,6 +96,7 @@ class InteractionFinder:
     _residuals: pd.Series = field(init=False, default_factory=pd.Series, repr=False)
     _candidate_features: list[str] = field(init=False, default_factory=list, repr=False)
     _categorical_features: set[str] = field(init=False, default_factory=set, repr=False)
+    _y_true: pd.Series | None = field(init=False, default=None, repr=False)
 
     def __post_init__(self) -> None:
         if self.n_bootstraps < 1:
@@ -120,6 +121,7 @@ class InteractionFinder:
         candidate_features: Sequence[str],
         categorical_features: Sequence[str] | None = None,
         *,
+        y_true: SeriesLike | None = None,
         splits: Sequence[CustomSplitLike] | None = None,
         group_col: Any = None,
     ) -> InteractionFinder:
@@ -132,6 +134,9 @@ class InteractionFinder:
             candidate_features: Features to evaluate pairwise. Must be ≤ max_candidate_features.
             categorical_features: Explicit list of categorical feature names (overrides dtype
                inference).
+            y_true: Original target values (same index as X). When provided, enables the
+               target-view panel in ``plot_interactions()``, showing where actual target
+               events concentrate in the feature space alongside the interaction effect.
             splits: Custom splits — list of dicts with train/validation keys or
                (train_idx, val_idx) tuples.
             group_col: Group labels when split_strategy='group_kfold'.
@@ -164,6 +169,11 @@ class InteractionFinder:
         self._X = X[features_list].copy()
         self._residuals = residual_series
         self._candidate_features = features_list
+        self._y_true = (
+            pd.Series(np.asarray(y_true, dtype=float), index=X.index, name="y_true")
+            if y_true is not None
+            else None
+        )
 
         group_series: pd.Series | None = None
         if group_col is not None:
@@ -233,9 +243,13 @@ class InteractionFinder:
     def plot_interactions(self, top_n: int = 5) -> dict[str, Figure]:
         """Return one diagnostic figure per top-N ranked interaction pair.
 
-        Each figure has two panels:
-        - Left: pair-type-aware interaction surface (continuous×continuous: net interaction
-          surface; mixed: conditional effect curves; categorical×categorical: residual heatmap).
+        Each figure has three panels:
+        - Left: interaction effect — scatterplot (or conditional curves / bubble chart) colored
+          by the per-point net effect (depth-2 prediction minus depth-1 prediction). Red areas
+          have positive interaction; blue areas have negative interaction.
+        - Centre: target view — same axes but colored by actual ``y_true`` values, so the
+          interaction effect can be read against where target events concentrate. Requires
+          ``y_true`` to be passed to ``fit()``.
         - Right: bootstrap interaction lift vs null lift distribution.
         """
         _require_fitted(self.interaction_summary_, "interaction_summary_")
@@ -265,7 +279,7 @@ class InteractionFinder:
     ) -> Figure:
         import matplotlib.pyplot as plt
 
-        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        fig, axes = plt.subplots(1, 3, figsize=(21, 6))
         lift = float(summary_row["mean_interaction_lift"])
         nbr = float(summary_row["interaction_null_beat_rate"])
         fig.suptitle(
@@ -277,28 +291,39 @@ class InteractionFinder:
         is_cat_b = feat_b in self._categorical_features
 
         if not is_cat_a and not is_cat_b:
-            self._plot_net_surface(feat_a, feat_b, axes[0])
+            val_idx, net = self._one_shot_net_predict(feat_a, feat_b, is_cat_a, is_cat_b)
+            self._plot_scatter_interaction(feat_a, feat_b, val_idx, net, axes[0])
+            self._plot_target_scatter(feat_a, feat_b, val_idx, axes[1])
         elif is_cat_a != is_cat_b:
             cat_feat = feat_a if is_cat_a else feat_b
             cont_feat = feat_b if is_cat_a else feat_a
             self._plot_conditional_curves(cont_feat, cat_feat, axes[0])
+            self._plot_target_conditional_curves(cont_feat, cat_feat, axes[1])
         else:
-            self._plot_cat_heatmap(feat_a, feat_b, axes[0])
+            val_idx, net = self._one_shot_net_predict(feat_a, feat_b, is_cat_a, is_cat_b)
+            self._plot_interaction_bubbles(feat_a, feat_b, val_idx, net, axes[0])
+            self._plot_target_bubbles(feat_a, feat_b, val_idx, axes[1])
 
-        self._plot_lift_dist(pair_boot, axes[1])
+        self._plot_lift_dist(pair_boot, axes[2])
         fig.tight_layout()
         return fig
 
-    def _plot_net_surface(self, feat_a: str, feat_b: str, ax: Any) -> None:
-        # TODO: consider replacing with 2D ALE in a future version.
+    def _one_shot_net_predict(
+        self,
+        feat_a: str,
+        feat_b: str,
+        is_cat_a: bool,
+        is_cat_b: bool,
+    ) -> tuple[np.ndarray[Any, Any], np.ndarray[Any, Any]]:
+        """Fit depth-1 and depth-2 models on 80% of data; return (val_idx, net_effect)."""
         n = len(self._X)
         rng = np.random.default_rng(self.random_state)
         train_size = max(1, int(round(0.8 * n)))
         train_idx = np.sort(rng.choice(np.arange(n), size=train_size, replace=False))
         val_idx = np.setdiff1d(np.arange(n), train_idx)
 
-        enc_a = _encode_feature(self._X[feat_a], False, train_idx)
-        enc_b = _encode_feature(self._X[feat_b], False, train_idx)
+        enc_a = _encode_feature(self._X[feat_a], is_cat_a, train_idx)
+        enc_b = _encode_feature(self._X[feat_b], is_cat_b, train_idx)
         X_tr = pd.DataFrame({"feature_a": enc_a[train_idx], "feature_b": enc_b[train_idx]})
         X_vl = pd.DataFrame({"feature_a": enc_a[val_idx], "feature_b": enc_b[val_idx]})
         train_y = self._residuals.iloc[train_idx].to_numpy(dtype=float)
@@ -307,28 +332,37 @@ class InteractionFinder:
         m2 = self._build_model(depth=2, seed=self.random_state)
         m1.fit(X_tr, train_y)
         m2.fit(X_tr, train_y)
-        net = np.asarray(m2.predict(X_vl), dtype=float) - np.asarray(m1.predict(X_vl), dtype=float)
+        net = (
+            np.asarray(m2.predict(X_vl), dtype=float)
+            - np.asarray(m1.predict(X_vl), dtype=float)
+        )
+        return val_idx, net
 
-        vals_a = pd.to_numeric(self._X[feat_a], errors="coerce").iloc[val_idx]
-        vals_b = pd.to_numeric(self._X[feat_b], errors="coerce").iloc[val_idx]
-        bins_a = pd.qcut(vals_a, q=5, duplicates="drop", labels=False)
-        bins_b = pd.qcut(vals_b, q=5, duplicates="drop", labels=False)
-
-        frame = pd.DataFrame(
-            {"bin_a": bins_a.to_numpy(), "bin_b": bins_b.to_numpy(), "net": net}
-        ).dropna()
-        pivot = frame.groupby(["bin_a", "bin_b"])["net"].mean().unstack(fill_value=np.nan)
-
+    def _plot_scatter_interaction(
+        self,
+        feat_a: str,
+        feat_b: str,
+        val_idx: np.ndarray[Any, Any],
+        net: np.ndarray[Any, Any],
+        ax: Any,
+    ) -> None:
         import matplotlib.pyplot as plt
 
-        vmax = float(np.nanmax(np.abs(pivot.values))) if not np.isnan(pivot.values).all() else 1.0
-        im = ax.imshow(
-            pivot.values, aspect="auto", cmap="RdBu_r", origin="lower", vmin=-vmax, vmax=vmax
+        vals_a = (
+            pd.to_numeric(self._X[feat_a], errors="coerce").iloc[val_idx].to_numpy(dtype=float)
         )
-        plt.colorbar(im, ax=ax, label="Net interaction (depth-2 − depth-1)")
-        ax.set_xlabel(f"{feat_b} (quantile bin)")
-        ax.set_ylabel(f"{feat_a} (quantile bin)")
-        ax.set_title("Net Interaction Surface")
+        vals_b = (
+            pd.to_numeric(self._X[feat_b], errors="coerce").iloc[val_idx].to_numpy(dtype=float)
+        )
+        vmax = float(np.nanmax(np.abs(net))) if len(net) > 0 else 1.0
+        sc = ax.scatter(
+            vals_a, vals_b, c=net, cmap="RdBu_r",
+            vmin=-vmax, vmax=vmax, alpha=0.6, s=18, rasterized=True,
+        )
+        plt.colorbar(sc, ax=ax, label="Interaction effect (depth-2 − depth-1)")
+        ax.set_xlabel(feat_a)
+        ax.set_ylabel(feat_b)
+        ax.set_title("Interaction Effect")
 
     def _plot_conditional_curves(self, cont_feat: str, cat_feat: str, ax: Any) -> None:
         residuals = self._residuals.to_numpy(dtype=float)
@@ -363,29 +397,181 @@ class InteractionFinder:
         ax.set_title(f"Conditional Effect: {cont_feat} by {cat_feat}")
         ax.legend(title=cat_feat, fontsize=8, framealpha=0.7)
 
-    def _plot_cat_heatmap(self, feat_a: str, feat_b: str, ax: Any) -> None:
+    def _plot_interaction_bubbles(
+        self,
+        feat_a: str,
+        feat_b: str,
+        val_idx: np.ndarray[Any, Any],
+        net: np.ndarray[Any, Any],
+        ax: Any,
+    ) -> None:
         import matplotlib.pyplot as plt
 
-        residuals = self._residuals.to_numpy(dtype=float)
         cats_a = self._X[feat_a].astype(str).value_counts().head(8).index.tolist()
         cats_b = self._X[feat_b].astype(str).value_counts().head(8).index.tolist()
-        grid = np.full((len(cats_a), len(cats_b)), np.nan)
+        a_vals = self._X[feat_a].astype(str).iloc[val_idx].to_numpy()
+        b_vals = self._X[feat_b].astype(str).iloc[val_idx].to_numpy()
+
+        xs: list[int] = []
+        ys: list[int] = []
+        sizes: list[float] = []
+        colors: list[float] = []
         for i, ca in enumerate(cats_a):
             for j, cb in enumerate(cats_b):
-                mask = self._X[feat_a].astype(str).eq(ca) & self._X[feat_b].astype(str).eq(cb)
-                if mask.sum() > 0:
-                    grid[i, j] = float(residuals[mask].mean())
+                mask = (a_vals == ca) & (b_vals == cb)
+                count = int(mask.sum())
+                if count > 0:
+                    xs.append(j)
+                    ys.append(i)
+                    sizes.append(max(30.0, count * 5.0))
+                    colors.append(float(net[mask].mean()))
 
-        vmax = float(np.nanmax(np.abs(grid))) if not np.isnan(grid).all() else 1.0
-        im = ax.imshow(grid, aspect="auto", cmap="RdBu_r", origin="lower", vmin=-vmax, vmax=vmax)
-        plt.colorbar(im, ax=ax, label="Mean residual")
+        if not xs:
+            ax.text(0.5, 0.5, "No data for bubble chart", ha="center", va="center")
+            ax.axis("off")
+            return
+
+        vmax = float(np.nanmax(np.abs(colors))) if colors else 1.0
+        sc = ax.scatter(
+            xs, ys, c=colors, s=sizes, cmap="RdBu_r",
+            vmin=-vmax, vmax=vmax, alpha=0.8,
+        )
+        plt.colorbar(sc, ax=ax, label="Mean interaction effect (depth-2 − depth-1)")
         ax.set_xticks(range(len(cats_b)))
         ax.set_xticklabels(cats_b, rotation=45, ha="right", fontsize=8)
         ax.set_yticks(range(len(cats_a)))
         ax.set_yticklabels(cats_a, fontsize=8)
         ax.set_xlabel(feat_b)
         ax.set_ylabel(feat_a)
-        ax.set_title("Mean Residual Heatmap")
+        ax.set_title("Interaction Effect (bubble size = count)")
+
+    def _plot_target_scatter(
+        self,
+        feat_a: str,
+        feat_b: str,
+        val_idx: np.ndarray[Any, Any],
+        ax: Any,
+    ) -> None:
+        import matplotlib.pyplot as plt
+
+        if self._y_true is None:
+            ax.text(
+                0.5, 0.5, "Pass y_true= to fit() to enable this view",
+                ha="center", va="center", color="grey", fontsize=10,
+            )
+            ax.set_title("Target View (unavailable)")
+            ax.axis("off")
+            return
+
+        vals_a = (
+            pd.to_numeric(self._X[feat_a], errors="coerce").iloc[val_idx].to_numpy(dtype=float)
+        )
+        vals_b = (
+            pd.to_numeric(self._X[feat_b], errors="coerce").iloc[val_idx].to_numpy(dtype=float)
+        )
+        y_vals = self._y_true.iloc[val_idx].to_numpy(dtype=float)
+        sc = ax.scatter(
+            vals_a, vals_b, c=y_vals, cmap="YlOrRd", alpha=0.6, s=18, rasterized=True,
+        )
+        plt.colorbar(sc, ax=ax, label="Target value")
+        ax.set_xlabel(feat_a)
+        ax.set_ylabel(feat_b)
+        ax.set_title("Target Distribution")
+
+    def _plot_target_conditional_curves(
+        self, cont_feat: str, cat_feat: str, ax: Any
+    ) -> None:
+        if self._y_true is None:
+            ax.text(
+                0.5, 0.5, "Pass y_true= to fit() to enable this view",
+                ha="center", va="center", color="grey", fontsize=10,
+            )
+            ax.set_title("Target View (unavailable)")
+            ax.axis("off")
+            return
+
+        y_vals = self._y_true.to_numpy(dtype=float)
+        cont_vals = pd.to_numeric(self._X[cont_feat], errors="coerce")
+        cat_vals = self._X[cat_feat].astype(str)
+        try:
+            cont_bins = pd.qcut(cont_vals, q=6, duplicates="drop")
+            bin_cats = list(cont_bins.cat.categories)
+        except Exception:
+            ax.text(0.5, 0.5, "Insufficient data for target curves", ha="center", va="center")
+            ax.axis("off")
+            return
+
+        colors = ["#2C7FB8", "#E34234", "#2E7D32", "#F28C00", "#7B2D8B"]
+        x = np.arange(len(bin_cats))
+        for i, cat in enumerate(cat_vals.value_counts().head(5).index):
+            cat_mask = cat_vals.eq(cat)
+            means = [
+                float(y_vals[cat_mask & cont_bins.eq(b)].mean())
+                if (cat_mask & cont_bins.eq(b)).sum() >= 5
+                else np.nan
+                for b in bin_cats
+            ]
+            ax.plot(x, means, marker="o", label=str(cat), color=colors[i % len(colors)])
+
+        ax.set_xticks(x)
+        ax.set_xticklabels([str(b) for b in bin_cats], rotation=45, ha="right", fontsize=8)
+        ax.set_xlabel(f"{cont_feat} (quantile bins)")
+        ax.set_ylabel("Mean target value")
+        ax.set_title(f"Target: {cont_feat} by {cat_feat}")
+        ax.legend(title=cat_feat, fontsize=8, framealpha=0.7)
+
+    def _plot_target_bubbles(
+        self,
+        feat_a: str,
+        feat_b: str,
+        val_idx: np.ndarray[Any, Any],
+        ax: Any,
+    ) -> None:
+        import matplotlib.pyplot as plt
+
+        if self._y_true is None:
+            ax.text(
+                0.5, 0.5, "Pass y_true= to fit() to enable this view",
+                ha="center", va="center", color="grey", fontsize=10,
+            )
+            ax.set_title("Target View (unavailable)")
+            ax.axis("off")
+            return
+
+        cats_a = self._X[feat_a].astype(str).value_counts().head(8).index.tolist()
+        cats_b = self._X[feat_b].astype(str).value_counts().head(8).index.tolist()
+        a_vals = self._X[feat_a].astype(str).iloc[val_idx].to_numpy()
+        b_vals = self._X[feat_b].astype(str).iloc[val_idx].to_numpy()
+        y_vals = self._y_true.iloc[val_idx].to_numpy(dtype=float)
+
+        xs: list[int] = []
+        ys: list[int] = []
+        sizes: list[float] = []
+        colors: list[float] = []
+        for i, ca in enumerate(cats_a):
+            for j, cb in enumerate(cats_b):
+                mask = (a_vals == ca) & (b_vals == cb)
+                count = int(mask.sum())
+                if count > 0:
+                    xs.append(j)
+                    ys.append(i)
+                    sizes.append(max(30.0, count * 5.0))
+                    colors.append(float(y_vals[mask].mean()))
+
+        if not xs:
+            ax.text(0.5, 0.5, "No data for bubble chart", ha="center", va="center")
+            ax.axis("off")
+            return
+
+        sc = ax.scatter(xs, ys, c=colors, s=sizes, cmap="YlOrRd", alpha=0.8)
+        plt.colorbar(sc, ax=ax, label="Mean target value")
+        ax.set_xticks(range(len(cats_b)))
+        ax.set_xticklabels(cats_b, rotation=45, ha="right", fontsize=8)
+        ax.set_yticks(range(len(cats_a)))
+        ax.set_yticklabels(cats_a, fontsize=8)
+        ax.set_xlabel(feat_b)
+        ax.set_ylabel(feat_a)
+        ax.set_title("Target Distribution (bubble size = count)")
 
     def _plot_lift_dist(self, pair_boot: pd.DataFrame, ax: Any) -> None:
         lift = pair_boot["interaction_lift"].dropna()
