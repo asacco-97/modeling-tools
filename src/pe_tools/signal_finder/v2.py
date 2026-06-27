@@ -34,6 +34,16 @@ OOF_WARNING = (
     "misleading artifacts."
 )
 
+# Semantic color palette used across all diagnostic panels
+_FEATURE_COLOR = "#2C7FB8"    # blue  — feature data / effect line
+_NULL_COLOR = "#9E9E9E"       # gray  — null / shuffled baseline
+_POSITIVE_COLOR = "#2E7D32"   # green — underprediction / positive signal
+_NEGATIVE_COLOR = "#C62828"   # red   — overprediction / negative signal
+_CI_COLOR = "#9ECAE1"         # light blue — confidence bands
+_COUNT_COLOR = "#BDBDBD"      # light gray — sample counts
+_ZERO_LINE_COLOR = "#424242"  # dark gray  — zero reference lines
+
+
 @dataclass(frozen=True)
 class _BinSpec:
     feature_type: FeatureType
@@ -320,65 +330,99 @@ class ResidualSignalFinderV2:
             raise ValueError(f"Unknown feature: {feature_name}")
         return matches.iloc[0].copy()
 
-    def plot_feature_diagnostics(self, feature_name: str) -> Figure:
-        """Create a multi-panel diagnostic figure for one evaluated feature."""
+    def plot_feature_diagnostics(
+        self,
+        feature_name: str,
+        *,
+        figsize: tuple[int, int] = (16, 10),
+        show_fliers: bool = False,
+    ) -> Figure:
+        """Create a polished four-panel diagnostic report for one evaluated feature."""
         _require_fitted(self.summary_, "summary_")
         self._require_feature(feature_name)
 
         import matplotlib.pyplot as plt
 
+        # --- shared data ---
+        feature_row = self.summary_.loc[self.summary_["feature"].eq(feature_name)].iloc[0]
         filtered_ec = _drop_degenerate_bins(self.effect_curves_, feature_name)
         curve = _feature_curve_summary(filtered_ec, feature_name)
         bins = curve["bin_label"].astype(str).tolist()
         x = np.arange(len(bins))
-        figure = plt.figure(figsize=(17, 18))
-        grid = figure.add_gridspec(
-            4, 2,
-            height_ratios=[1.3, 1.3, 0.35, 1.0],
-            hspace=0.55,
-            wspace=0.35,
-        )
-        actual_axis = figure.add_subplot(grid[0, :])
-        boxplot_axis = figure.add_subplot(grid[1, :], sharex=actual_axis)
-        count_axis = figure.add_subplot(grid[2, :], sharex=actual_axis)
-        partial_axis = figure.add_subplot(grid[3, 0])
-        stability_axis = figure.add_subplot(grid[3, 1])
 
-        actual_axis.plot(x, curve["actual_mean"], marker="o", label="actual")
-        actual_axis.fill_between(
-            x,
-            curve["actual_ci_low"].to_numpy(dtype=float),
-            curve["actual_ci_high"].to_numpy(dtype=float),
-            alpha=0.18,
-            label="actual 95% CI",
-        )
-        actual_axis.plot(x, curve["base_prediction_mean"], marker="o", label="base prediction")
-        actual_axis.fill_between(
-            x,
-            curve["base_prediction_ci_low"].to_numpy(dtype=float),
-            curve["base_prediction_ci_high"].to_numpy(dtype=float),
-            alpha=0.18,
-            label="base prediction 95% CI",
-        )
-        actual_axis.set_title("Actual vs. Base Prediction by Feature Bin (Bootstrap CI)")
-        actual_axis.set_ylabel("Mean actual / prediction")
-        actual_axis.legend(loc="best")
+        validation_mask = self.bootstrap_results_["split_role"].eq("validation")
+        feature_mask = self.bootstrap_results_["feature"].eq(feature_name)
+        feature_r2 = self.bootstrap_results_.loc[
+            validation_mask & feature_mask, "oof_r2"
+        ].dropna()
 
-        self._plot_residual_boxplot_on_axis(feature_name, boxplot_axis, bins, filtered_ec, curve)
-        self._plot_bin_counts_on_axis(feature_name, count_axis, bins, x)
-        self._plot_partial_residual_on_axis(feature_name, partial_axis, curve, filtered_ec)
-        self._plot_bootstrap_r2_distribution_on_axis(feature_name, stability_axis)
+        null_r2: pd.Series = pd.Series(dtype=float)
+        if not self.null_results_.empty and "source_feature" in self.null_results_.columns:
+            null_r2 = self.null_results_.loc[
+                self.null_results_["source_feature"].eq(feature_name), "oof_r2"
+            ].dropna()
 
-        actual_axis.set_xticks(x)
-        actual_axis.set_xticklabels([])
-        boxplot_axis.set_xticks(x)
-        boxplot_axis.set_xticklabels([])
-        count_axis.set_xticks(x)
-        count_axis.set_xticklabels(bins)
-        count_axis.tick_params(axis="x", labelsize=9)
-        plt.setp(count_axis.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
-        figure.suptitle(f"Residual Signal Diagnostics: {feature_name}", y=1.01)
-        figure.tight_layout()
+        bin_frame = self._full_bin_frame(feature_name)
+        bin_str = bin_frame["bin_label"].astype(str)
+        bin_counts = [int(bin_str.eq(label).sum()) for label in bins]
+
+        # --- layout: header / (null-R² | spearman) / (boxplot | actual+count) ---
+        # constrained_layout computes inter-panel spacing automatically and works correctly
+        # with nested subgridspecs, avoiding the label/title collisions tight_layout misses.
+        figure = plt.figure(figsize=figsize, layout="constrained")
+        figure.get_layout_engine().set(h_pad=0.4)
+
+        # outer[2] height = residual_height + count_height = 6.876 + 1.169 = 8.05
+        # inner ratios [9, 1.53] give residuals 9/10.53 * 8.05 ≈ 6.88 (×1.8 of original 3.82)
+        # and count strips 1.53/10.53 * 8.05 ≈ 1.17 (×1.5 of original 0.78).
+        outer = figure.add_gridspec(3, 1, height_ratios=[0.7, 4.5, 8.05])
+        header_ax = figure.add_subplot(outer[0])
+
+        mid_top_gs = outer[1].subgridspec(1, 2, wspace=0.28)
+        null_r2_ax = figure.add_subplot(mid_top_gs[0])
+        spearman_ax = figure.add_subplot(mid_top_gs[1])
+
+        mid_bot_gs = outer[2].subgridspec(1, 2, wspace=0.28)
+        left_bot_gs = mid_bot_gs[0].subgridspec(2, 1, height_ratios=[9, 1.53], hspace=0.02)
+        boxplot_ax = figure.add_subplot(left_bot_gs[0])
+        boxplot_count_ax = figure.add_subplot(left_bot_gs[1], sharex=boxplot_ax)
+        right_gs = mid_bot_gs[1].subgridspec(2, 1, height_ratios=[9, 1.53], hspace=0.02)
+        actual_ax = figure.add_subplot(right_gs[0])
+        count_ax = figure.add_subplot(right_gs[1], sharex=actual_ax)
+
+        # --- header ---
+        _plot_diagnostic_header(header_ax, feature_name, feature_row)
+
+        # --- panel 1: OOF R² vs null ---
+        self._plot_null_r2_comparison_on_axis(
+            feature_name, null_r2_ax, feature_r2, null_r2, feature_row
+        )
+
+        # --- panel 2 (top right): spearman stability ---
+        self._plot_spearman_correlation_on_axis(feature_name, spearman_ax)
+
+        # --- panel 3 (bottom left): residual boxplots by bin + count strip ---
+        self._plot_residual_boxplot_on_axis(
+            feature_name, boxplot_ax, bins, filtered_ec, curve, show_fliers=show_fliers
+        )
+        _plot_count_strip_on_axis(boxplot_count_ax, bins, bin_counts, x)
+        boxplot_ax.set_xticks(x)
+        plt.setp(boxplot_ax.get_xticklabels(), visible=False)
+        boxplot_count_ax.set_xticks(x)
+        boxplot_count_ax.set_xticklabels(bins)
+        boxplot_count_ax.tick_params(axis="x", labelsize=9)
+        _auto_rotate_xticklabels(boxplot_count_ax)
+
+        # --- panel 4 (bottom right): actual vs. base prediction + count strip ---
+        self._plot_actual_vs_pred_on_axis(feature_name, actual_ax, curve, x)
+        _plot_count_strip_on_axis(count_ax, bins, bin_counts, x)
+        actual_ax.set_xticks(x)
+        plt.setp(actual_ax.get_xticklabels(), visible=False)
+        count_ax.set_xticks(x)
+        count_ax.set_xticklabels(bins)
+        count_ax.tick_params(axis="x", labelsize=9)
+        _auto_rotate_xticklabels(count_ax)
+
         return figure
 
     def plot_top_features(self, n: int = 10) -> dict[str, Figure]:
@@ -1020,6 +1064,131 @@ class ResidualSignalFinderV2:
             )
         return pd.DataFrame(rows)
 
+    def _plot_null_r2_comparison_on_axis(
+        self,
+        feature_name: str,
+        axis: Any,
+        feature_r2: pd.Series,
+        null_r2: pd.Series,
+        feature_row: pd.Series,
+    ) -> None:
+        has_null = not null_r2.empty
+        all_vals = pd.concat([feature_r2, null_r2]).dropna()
+        if all_vals.empty:
+            axis.text(0.5, 0.5, "No bootstrap R² data", ha="center", va="center")
+            axis.axis("off")
+            return
+
+        lo, hi = float(all_vals.min()), float(all_vals.max())
+        if lo == hi:
+            lo, hi = lo - 0.01, hi + 0.01
+        bin_edges = np.linspace(lo, hi, 21)
+
+        if has_null:
+            axis.hist(null_r2, bins=bin_edges, color=_NULL_COLOR, alpha=0.65, label="Null (shuffled)")
+        axis.hist(feature_r2, bins=bin_edges, color=_FEATURE_COLOR, alpha=0.70, label="Feature")
+
+        mean_feature = float(feature_r2.mean())
+        axis.axvline(
+            mean_feature, color=_FEATURE_COLOR, linewidth=2.0,
+            label=f"Feature mean: {mean_feature:.4f}",
+        )
+        mean_null: float | None = None
+        if has_null:
+            mean_null = float(null_r2.mean())
+            axis.axvline(
+                mean_null, color=_NULL_COLOR, linewidth=2.0, linestyle="--",
+                label=f"Null mean: {mean_null:.4f}",
+            )
+        axis.axvline(0.0, color=_ZERO_LINE_COLOR, linewidth=1.2, linestyle=":", label="Zero")
+
+        prob_gt0 = float(feature_row.get("prob_residual_signal_gt_zero", np.nan))
+        null_beat = float(feature_row.get("null_beat_rate", np.nan))
+        anno: list[str] = [f"Feature mean R²: {mean_feature:.4f}"]
+        if mean_null is not None:
+            anno.append(f"Null mean R²: {mean_null:.4f}")
+        anno.append(f"P(R² > 0): {prob_gt0:.0%}" if np.isfinite(prob_gt0) else "P(R² > 0): n/a")
+        if np.isfinite(null_beat):
+            anno.append(f"P(feature > null): {null_beat:.0%}")
+        axis.text(
+            0.97, 0.97, "\n".join(anno),
+            transform=axis.transAxes, ha="right", va="top",
+            fontsize=9, color="#333333",
+            bbox={"boxstyle": "round,pad=0.3", "facecolor": "white", "alpha": 0.85, "edgecolor": "#cccccc"},
+        )
+        if not has_null:
+            axis.text(
+                0.03, 0.97, "Null comparison unavailable",
+                transform=axis.transAxes, ha="left", va="top",
+                fontsize=8, color="#888888",
+            )
+
+        axis.set_xlabel("Bootstrap OOF residual R²", fontsize=10)
+        axis.set_ylabel("Bootstrap run count", fontsize=10)
+        axis.set_title("OOF R² vs. Null Distribution", fontsize=11)
+        axis.legend(loc="upper left", fontsize=8, framealpha=0.7)
+        _style_diagnostic_axis(axis)
+
+    def _plot_actual_vs_pred_on_axis(
+        self,
+        feature_name: str,
+        axis: Any,
+        curve: pd.DataFrame,
+        x: "np.ndarray[Any, Any]",
+    ) -> None:
+        actual_mean = curve["actual_mean"].to_numpy(dtype=float)
+        actual_ci_low = curve["actual_ci_low"].to_numpy(dtype=float)
+        actual_ci_high = curve["actual_ci_high"].to_numpy(dtype=float)
+        pred_mean = curve["base_prediction_mean"].to_numpy(dtype=float)
+        pred_ci_low = curve["base_prediction_ci_low"].to_numpy(dtype=float)
+        pred_ci_high = curve["base_prediction_ci_high"].to_numpy(dtype=float)
+
+        axis.fill_between(x, actual_ci_low, actual_ci_high, color=_CI_COLOR, alpha=0.40)
+        axis.plot(
+            x, actual_mean,
+            color=_FEATURE_COLOR, linewidth=2.0, marker="o", markersize=5, label="Actual",
+        )
+        axis.fill_between(x, pred_ci_low, pred_ci_high, color=_NULL_COLOR, alpha=0.30)
+        axis.plot(
+            x, pred_mean,
+            color=_NULL_COLOR, linewidth=2.0, marker="s", markersize=5,
+            linestyle="--", label="Base prediction",
+        )
+        axis.set_ylabel("Mean value", fontsize=10)
+        axis.set_title("Actual vs. Base Prediction by Feature Bin", fontsize=11)
+        axis.legend(loc="best", fontsize=8, framealpha=0.7)
+        _style_diagnostic_axis(axis)
+
+    def _plot_residual_by_bin_on_axis(
+        self,
+        feature_name: str,
+        axis: Any,
+        curve: pd.DataFrame,
+        x: "np.ndarray[Any, Any]",
+    ) -> None:
+        res_mean = curve["residual_error_mean"].to_numpy(dtype=float)
+        ci_low = curve["residual_error_ci_low"].to_numpy(dtype=float)
+        ci_high = curve["residual_error_ci_high"].to_numpy(dtype=float)
+
+        point_colors = [_POSITIVE_COLOR if v > 0 else _NEGATIVE_COLOR for v in res_mean]
+        axis.fill_between(x, ci_low, ci_high, color=_CI_COLOR, alpha=0.45, label="95% CI")
+        axis.plot(x, res_mean, color=_FEATURE_COLOR, linewidth=2.0, zorder=4)
+        axis.scatter(
+            x, res_mean,
+            color=point_colors, s=55, zorder=5,
+            edgecolors="white", linewidths=0.7,
+        )
+        axis.axhline(0.0, color=_ZERO_LINE_COLOR, linewidth=1.2, linestyle="--")
+        axis.set_ylabel("Residual (actual − base prediction)", fontsize=10)
+        axis.set_title("Residual by Feature Bin", fontsize=11)
+        axis.text(
+            0.99, 0.03,
+            "↑ underprediction   ↓ overprediction",
+            transform=axis.transAxes, ha="right", va="bottom",
+            fontsize=8, color="#666666",
+        )
+        _style_diagnostic_axis(axis)
+
     def _plot_residual_boxplot_on_axis(
         self,
         feature_name: str,
@@ -1027,6 +1196,7 @@ class ResidualSignalFinderV2:
         retained_bin_labels: list[str],
         filtered_ec: pd.DataFrame,
         curve: pd.DataFrame,
+        show_fliers: bool = False,
     ) -> None:
         # Use bootstrap validation mean_residual per bin — consistent with Actual vs Pred panel
         feature_curves = filtered_ec.loc[filtered_ec["feature"].eq(feature_name)]
@@ -1047,25 +1217,26 @@ class ResidualSignalFinderV2:
         non_empty = [arr for arr in data_by_bin if len(arr) > 0]
         if not non_empty:
             axis.text(0.5, 0.5, "No data available", ha="center", va="center")
-            axis.set_title("Residual Distribution by Feature Bin")
+            axis.set_title("Residual Distribution by Bin")
             return
         axis.boxplot(
             data_by_bin,
             positions=x,
             widths=0.6,
             patch_artist=True,
-            showfliers=False,
-            medianprops={"color": "#e05c00", "linewidth": 2.0},
-            boxprops={"facecolor": "#d0e4f5", "alpha": 0.75},
-            whiskerprops={"linewidth": 1.2},
-            capprops={"linewidth": 1.2},
+            showfliers=show_fliers,
+            medianprops={"color": _FEATURE_COLOR, "linewidth": 2.0},
+            boxprops={"facecolor": _CI_COLOR, "alpha": 0.65},
+            whiskerprops={"linewidth": 1.0, "color": "#555555"},
+            capprops={"linewidth": 1.0, "color": "#555555"},
         )
         means = [float(arr.mean()) if len(arr) else np.nan for arr in data_by_bin]
-        axis.scatter(x, means, color="#2a6a94", zorder=5, s=30, marker="D", label="mean")
-        axis.axhline(0.0, linestyle=":", color="black", linewidth=1.0)
-        axis.set_title("Residual Distribution by Feature Bin (Bootstrap Validation)")
-        axis.set_ylabel("Mean residual per bootstrap run")
-        axis.legend(loc="best", fontsize=8)
+        axis.scatter(x, means, color=_FEATURE_COLOR, zorder=5, s=28, marker="D", label="mean")
+        axis.axhline(0.0, color=_ZERO_LINE_COLOR, linestyle="--", linewidth=1.0)
+        axis.set_title("Residual Distribution by Bin", fontsize=11)
+        axis.set_ylabel("Mean residual per bootstrap run", fontsize=10)
+        axis.legend(loc="best", fontsize=8, framealpha=0.7)
+        _style_diagnostic_axis(axis)
 
     def _plot_bin_counts_on_axis(
         self,
@@ -1165,6 +1336,58 @@ class ResidualSignalFinderV2:
             "Partial Residual Plot\n(positive = underprediction, negative = overprediction)",
             fontsize=9,
         )
+
+    def _plot_spearman_correlation_on_axis(self, feature_name: str, axis: Any) -> None:
+        # Use the same pairwise bootstrap Spearman values that produce the header's Stability metric.
+        # _effect_curve_pairwise_spearman returns all bootstrap-pair correlations of
+        # centered_mean_residual vectors, so median(spearman_vals) == median_effect_curve_spearman_stability.
+        axis.set_title("Bootstrap Spearman Effect Curve Correlation", fontsize=11)
+        spearman_vals = _effect_curve_pairwise_spearman(self.effect_curves_, feature_name)
+        if spearman_vals.empty:
+            # Fall back to the pre-computed summary value so the panel is still informative.
+            feature_row = self.summary_.loc[self.summary_["feature"].eq(feature_name)]
+            median_from_summary = (
+                float(feature_row["median_effect_curve_spearman_stability"].iloc[0])
+                if not feature_row.empty
+                else np.nan
+            )
+            msg = "Insufficient reliable bins for\npairwise stability histogram."
+            if np.isfinite(median_from_summary):
+                msg += f"\n\nSummary median ρ: {median_from_summary:.3f}"
+            axis.text(0.5, 0.5, msg, ha="center", va="center", fontsize=10, color="#555555",
+                      transform=axis.transAxes)
+            axis.set_xlabel("Pairwise bootstrap effect-curve Spearman ρ", fontsize=10)
+            axis.set_ylabel("Pair count", fontsize=10)
+            _style_diagnostic_axis(axis)
+            return
+
+        axis.hist(spearman_vals, bins=min(15, len(spearman_vals)), color=_FEATURE_COLOR, alpha=0.65)
+        median_rho = float(spearman_vals.median())
+        mean_rho = float(spearman_vals.mean())
+        prob_pos = float((spearman_vals > 0.0).mean())
+
+        axis.axvline(median_rho, color=_FEATURE_COLOR, linewidth=2.0, label=f"median: {median_rho:.3f}")
+        axis.axvline(mean_rho, color=_FEATURE_COLOR, linewidth=1.2, linestyle="--", label=f"mean: {mean_rho:.3f}")
+        axis.axvline(0.0, color=_ZERO_LINE_COLOR, linewidth=1.0, linestyle=":")
+
+        if median_rho >= 0.60:
+            stability_label, label_color = "STABLE", _POSITIVE_COLOR
+        elif median_rho >= 0.40:
+            stability_label, label_color = "MODERATE", "#E65100"
+        else:
+            stability_label, label_color = "UNSTABLE", _NEGATIVE_COLOR
+
+        axis.text(
+            0.97, 0.97,
+            f"Median ρ: {median_rho:.3f}\nP(ρ > 0): {prob_pos:.0%}\nPattern: {stability_label}",
+            transform=axis.transAxes, ha="right", va="top",
+            fontsize=9, color=label_color,
+            bbox={"boxstyle": "round,pad=0.3", "facecolor": "white", "alpha": 0.85, "edgecolor": "#cccccc"},
+        )
+        axis.set_xlabel("Pairwise bootstrap effect-curve Spearman ρ", fontsize=10)
+        axis.set_ylabel("Pair count", fontsize=10)
+        axis.legend(loc="upper left", fontsize=8, framealpha=0.7)
+        _style_diagnostic_axis(axis)
 
     def _plot_bootstrap_r2_distribution_on_axis(self, feature_name: str, axis: Any) -> None:
         validation_mask = self.bootstrap_results_["split_role"].eq("validation")
@@ -2607,3 +2830,107 @@ def _build_html_report(
   {warnings_html}
 </body>
 </html>"""
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers for diagnostic plot panels
+# ---------------------------------------------------------------------------
+
+def _style_diagnostic_axis(axis: Any) -> None:
+    """Apply clean spine and grid style to a diagnostic axis."""
+    axis.spines["top"].set_visible(False)
+    axis.spines["right"].set_visible(False)
+    axis.grid(axis="y", alpha=0.25, linewidth=0.8)
+    axis.tick_params(labelsize=9)
+
+
+def _plot_diagnostic_header(
+    axis: Any,
+    feature_name: str,
+    feature_row: pd.Series,
+) -> None:
+    """Render a compact text header with key summary metrics."""
+    mean_r2 = float(feature_row.get("mean_oof_residual_r2", np.nan))
+    prob_gt0 = float(feature_row.get("prob_residual_signal_gt_zero", np.nan))
+    null_beat = float(feature_row.get("null_beat_rate", np.nan))
+    stability = float(feature_row.get("median_effect_curve_spearman_stability", np.nan))
+    category = str(feature_row.get("action_category", "")).upper()
+
+    r2_str = f"{mean_r2:.4f}" if np.isfinite(mean_r2) else "n/a"
+    prob_str = f"{prob_gt0:.0%}" if np.isfinite(prob_gt0) else "n/a"
+    null_str = f"{null_beat:.0%}" if np.isfinite(null_beat) else "n/a"
+    stab_str = f"{stability:.3f}" if np.isfinite(stability) else "n/a"
+
+    axis.text(
+        0.0, 0.80, feature_name,
+        transform=axis.transAxes,
+        fontsize=15, fontweight="bold", va="top",
+    )
+    metrics = (
+        f"OOF residual R²: {r2_str}  |  P(R² > 0): {prob_str}  |  "
+        f"Null beat rate: {null_str}  |  Stability: {stab_str}  |  "
+        f"Opportunity: {category}"
+    )
+    axis.text(
+        0.0, 0.12, metrics,
+        transform=axis.transAxes,
+        fontsize=11, color="#444444", va="top",
+    )
+    axis.axis("off")
+
+
+def _plot_count_strip_on_axis(
+    axis: Any,
+    bin_labels: list[str],
+    bin_counts: list[int],
+    x: "np.ndarray[Any, Any]",
+) -> None:
+    """Render a compact bar strip of bin sample counts."""
+    import matplotlib.ticker as mticker
+
+    axis.bar(x, bin_counts, color=_COUNT_COLOR, width=0.7)
+    axis.set_ylabel("n", fontsize=8)
+    axis.tick_params(axis="y", labelsize=7, length=0)
+    axis.yaxis.set_major_locator(mticker.MaxNLocator(4, integer=True))
+    axis.spines["top"].set_visible(False)
+    axis.spines["right"].set_visible(False)
+    axis.spines["left"].set_alpha(0.3)
+    axis.grid(axis="y", linestyle=":", alpha=0.6, linewidth=0.8)
+
+
+def _auto_rotate_xticklabels(axis: Any, rotation: int = 45) -> None:
+    """Rotate x-tick labels only when adjacent labels would visually overlap."""
+    axis.figure.canvas.draw()
+    labels = axis.get_xticklabels()
+    if len(labels) < 2:
+        return
+    bboxes = [lab.get_window_extent() for lab in labels]
+    if any(bboxes[i].xmax > bboxes[i + 1].xmin for i in range(len(bboxes) - 1)):
+        import matplotlib.pyplot as plt
+        plt.setp(labels, rotation=rotation, ha="right", rotation_mode="anchor")
+
+
+def _plot_recommendation_footer(axis: Any, feature_row: pd.Series) -> None:
+    """Render a text-only recommendation panel with a semantic background."""
+    category = str(feature_row.get("action_category", "weak"))
+    recommendation = str(feature_row.get("action_recommendation", "No recommendation available."))
+
+    bg_color = {"strong": "#E8F5E9", "moderate": "#FFF9C4"}.get(category, "#F5F5F5")
+    axis.set_facecolor(bg_color)
+    for spine in axis.spines.values():
+        spine.set_visible(False)
+    axis.set_xticks([])
+    axis.set_yticks([])
+
+    axis.text(
+        0.01, 0.92,
+        f"Residual Opportunity: {category.upper()}",
+        transform=axis.transAxes,
+        fontsize=12, fontweight="bold", va="top",
+    )
+    axis.text(
+        0.01, 0.55,
+        recommendation,
+        transform=axis.transAxes,
+        fontsize=10, va="top", color="#333333",
+    )

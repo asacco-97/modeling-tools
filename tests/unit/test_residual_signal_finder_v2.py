@@ -227,20 +227,20 @@ def test_v2_plot_methods_return_figures() -> None:
     assert isinstance(diagnostics, Figure)
     assert isinstance(finder.plot_rank_stability(n=3), Figure)
     assert isinstance(finder.plot_residual_signal_map(), Figure)
-    assert len(diagnostics.axes) == 5
-    assert diagnostics.axes[0].get_title() == (
-        "Actual vs. Base Prediction by Feature Bin (Bootstrap CI)"
-    )
-    assert diagnostics.axes[1].get_title() == "Residual Distribution by Feature Bin (Bootstrap Validation)"
-    assert diagnostics.axes[2].get_title() == "Sample Count per Bin"
-    assert "Partial Residual Plot" in diagnostics.axes[3].get_title()
-    assert diagnostics.axes[4].get_title() == "Bootstrap Residual R² Distribution"
+    # Layout: header, null_r2, spearman, boxplot, boxplot_count, actual, count_strip = 7 axes
+    assert len(diagnostics.axes) == 7
+    assert diagnostics.axes[1].get_title() == "OOF R² vs. Null Distribution"
+    assert diagnostics.axes[2].get_title() == "Bootstrap Spearman Effect Curve Correlation"
+    assert diagnostics.axes[3].get_title() == "Residual Distribution by Bin"
+    # axes[4] is the boxplot count strip — no title
+    assert diagnostics.axes[5].get_title() == "Actual vs. Base Prediction by Feature Bin"
+    # axes[6] is the actual count strip — no title
     top_figures = finder.plot_top_features(n=2)
     assert len(top_figures) == 2
     assert all(isinstance(figure, Figure) for figure in top_figures.values())
 
 
-def test_v2_classification_diagnostics_produce_four_panel_figure() -> None:
+def test_v2_classification_diagnostics_produce_seven_panel_figure() -> None:
     X, y_true, y_pred, _sample_weight, _split_col = make_v2_data()
     binary_target = (y_true > y_true.median()).astype(float)
     base_probability = pd.Series(
@@ -257,7 +257,19 @@ def test_v2_classification_diagnostics_produce_four_panel_figure() -> None:
 
     diagnostics = finder.plot_feature_diagnostics(top_feature)
 
-    assert len(diagnostics.axes) == 5
+    assert len(diagnostics.axes) == 7
+
+
+def test_v2_plot_handles_missing_null_distribution() -> None:
+    X, y_true, y_pred, sample_weight, _split_col = make_v2_data()
+    finder = make_v2_finder().fit(X, y=y_true, base_pred=y_pred, sample_weight=sample_weight)
+    finder.null_results_ = pd.DataFrame()
+    top_feature = str(finder.get_summary().iloc[0]["feature"])
+
+    fig = finder.plot_feature_diagnostics(top_feature)
+
+    assert isinstance(fig, Figure)
+    assert len(fig.axes) == 7
 
 
 def test_v2_discrete_numeric_bins_never_emit_zero_observation_rows() -> None:
