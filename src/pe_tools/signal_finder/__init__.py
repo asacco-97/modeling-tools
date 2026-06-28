@@ -7,11 +7,11 @@ from pe_tools.signal_finder.core import (
     find_residual_signal,
     residualize,
 )
-from pe_tools.signal_finder.interaction_finder import InteractionFinder
+from pe_tools.signal_finder.feature_selector import FeatureSelector
 from pe_tools.signal_finder.v2 import ResidualSignalFinderV2
 
 __all__ = [
-    "InteractionFinder",
+    "FeatureSelector",
     "ResidualSignalFinder",
     "ResidualSignalFinderResult",
     "ResidualSignalFinderV2",
