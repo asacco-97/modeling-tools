@@ -901,7 +901,7 @@ class FeatureSelector:
     def _build_model(self, depth: int, seed: int) -> Any:
         if self.model_type == "xgboost":
             params: dict[str, Any] = {
-                "n_estimators": 120,
+                "n_estimators": 50,
                 "max_depth": depth,
                 "learning_rate": 0.05,
                 "subsample": 0.8,
@@ -917,7 +917,7 @@ class FeatureSelector:
             return XGBRegressor(**params)
 
         params = {
-            "n_estimators": 160,
+            "n_estimators": 50,
             "max_depth": depth,
             "min_samples_leaf": 10,
             "max_features": 1.0,
