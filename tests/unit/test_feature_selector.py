@@ -269,13 +269,6 @@ def test_plot_interactions_returns_dict_of_figures() -> None:
     assert all(isinstance(f, Figure) for f in figs.values())
 
 
-def test_plot_interaction_surface_returns_figure() -> None:
-    selector = _make_selector(n_bootstraps=10)
-    selector.find_interactions(top_n=4)
-    fig = selector.plot_interaction_surface("x2", "x3")
-    assert isinstance(fig, Figure)
-
-
 # ---------------------------------------------------------------------------
 # 7. exclude_features
 # ---------------------------------------------------------------------------

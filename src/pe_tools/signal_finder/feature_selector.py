@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import base64
+import html as _html
+import io
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from itertools import combinations
 from typing import Any
 
@@ -84,16 +88,23 @@ def _spearman_safe(x: np.ndarray[Any, Any], y: np.ndarray[Any, Any]) -> float:
         return float("nan")
 
 
+def _fs_figure_to_base64(fig: Any) -> str:
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=120)
+    buf.seek(0)
+    return base64.b64encode(buf.read()).decode("utf-8")
+
+
 @dataclass
 class FeatureSelector:
     """Bootstrap-based feature selector that works on raw (X, y).
 
     Evaluates each feature independently across bootstrap or k-fold splits,
-    comparing lift against a permuted-null baseline. Optional multivariate
-    refinement prunes features whose marginal importance is weak and computes
-    pairwise Spearman correlations among selected features.
+    comparing lift against a permuted-null baseline. After fit(), always computes
+    pairwise Spearman correlations among selected features and groups them into
+    clusters.
 
-    After `.fit()`, call `.find_interactions()` to detect pairwise interaction
+    After .fit(), call .find_interactions() to detect pairwise interaction
     effects among selected features.
     """
 
@@ -106,8 +117,6 @@ class FeatureSelector:
     random_state: int = 42
     null_beat_rate_threshold: float = 0.80
     positive_score_rate_threshold: float = 0.80
-    refinement_enabled: bool = False
-    n_refinement_bootstraps: int = 20
     correlation_threshold: float = 0.20
     model_params: dict[str, Any] | None = None
     verbose: bool = False
@@ -115,7 +124,6 @@ class FeatureSelector:
     summary_: pd.DataFrame = field(init=False, default_factory=pd.DataFrame)
     bootstrap_results_: pd.DataFrame = field(init=False, default_factory=pd.DataFrame)
     selected_features_: list[str] = field(init=False, default_factory=list)
-    refinement_summary_: pd.DataFrame = field(init=False, default_factory=pd.DataFrame)
     feature_correlation_: pd.DataFrame = field(init=False, default_factory=pd.DataFrame)
     interaction_summary_: pd.DataFrame = field(init=False, default_factory=pd.DataFrame)
     interaction_bootstrap_results_: pd.DataFrame = field(init=False, default_factory=pd.DataFrame)
@@ -141,8 +149,6 @@ class FeatureSelector:
             raise ValueError("n_splits must be at least 2")
         if self.max_depth < 1:
             raise ValueError("max_depth must be at least 1")
-        if self.n_refinement_bootstraps < 1:
-            raise ValueError("n_refinement_bootstraps must be at least 1")
 
     def fit(
         self,
@@ -260,9 +266,12 @@ class FeatureSelector:
             self.summary_["selected"], "feature"
         ].tolist()
 
-        if self.refinement_enabled and len(self.selected_features_) >= 2:
-            self._run_refinement(y_series)
+        if len(self.selected_features_) >= 2:
+            self.feature_correlation_ = self._compute_feature_correlation()
+        else:
+            self.feature_correlation_ = pd.DataFrame()
 
+        print(f"FeatureSelector: {len(self.selected_features_)} features selected")
         self._fitted = True
         return self
 
@@ -378,7 +387,7 @@ class FeatureSelector:
         )
         ax_left.set_yticks(y_pos)
         ax_left.set_yticklabels(df["feature"].tolist(), fontsize=9)
-        metric_label = "Gini (2·AUC − 1)" if self._is_binary else "Spearman correlation"
+        metric_label = "Gini (2·AUC − 1)" if self._is_binary else "Spearman ρ"
         ax_left.set_xlabel(metric_label)
         ax_left.set_title("Mean Robust Metric  (green = selected, gray = not selected)")
         ax_left.axvline(0.0, color=_ZERO_LINE_COLOR, linewidth=1.0, linestyle=":")
@@ -405,44 +414,167 @@ class FeatureSelector:
         fig.tight_layout()
         return fig
 
+    def plot_feature_response(self, top_n: int = 10) -> Figure:
+        """Grid of univariate response curves for the top-N selected features.
+
+        For each feature shows mean(y) binned by feature value, with observation
+        counts as a bar strip below. Continuous features use 10 quantile bins;
+        categorical features show top-10 levels sorted by mean(y) descending.
+
+        Useful for identifying non-linearities before feature engineering.
+        """
+        _require_fitted(self, "plot_feature_response()")
+
+        import matplotlib.pyplot as plt
+
+        feats = [
+            f for f in self.summary_["feature"].tolist()
+            if f in self.selected_features_
+        ][:top_n]
+        if not feats:
+            raise RuntimeError("No selected features to plot.")
+
+        ncols = min(3, len(feats))
+        nrows = (len(feats) + ncols - 1) // ncols
+        fig, axes = plt.subplots(
+            nrows, ncols,
+            figsize=(6 * ncols, 4 * nrows),
+            squeeze=False,
+        )
+
+        y_arr = self._y.to_numpy(dtype=float)
+        y_label = "Mean target (y)"
+
+        for idx, feat in enumerate(feats):
+            ax = axes[idx // ncols][idx % ncols]
+            is_cat = feat in self._categorical_features
+            vals = self._X[feat]
+
+            if is_cat:
+                str_vals = vals.astype(str)
+                counts = str_vals.value_counts()
+                top_levels = counts.head(10).index.tolist()
+                means = [
+                    float(y_arr[str_vals.eq(lv)].mean()) for lv in top_levels
+                ]
+                cnts = [int(counts[lv]) for lv in top_levels]
+                order = sorted(range(len(top_levels)), key=lambda i: means[i], reverse=True)
+                labels = [top_levels[i] for i in order]
+                bar_means = [means[i] for i in order]
+                bar_cnts = [cnts[i] for i in order]
+
+                x = np.arange(len(labels))
+                ax.bar(x, bar_means, color=_FEATURE_COLOR, alpha=0.75)
+                ax.set_xticks(x)
+                ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+
+                ax2 = ax.twinx()
+                ax2.bar(x, bar_cnts, color="#CCCCCC", alpha=0.35, zorder=0)
+                ax2.set_ylabel("Count", fontsize=8, color="#888888")
+                ax2.tick_params(axis="y", labelsize=7, labelcolor="#888888")
+
+            else:
+                num_vals = pd.to_numeric(vals, errors="coerce")
+                try:
+                    binned = pd.qcut(num_vals, q=10, duplicates="drop")
+                except Exception:
+                    ax.text(0.5, 0.5, "Cannot bin", ha="center", va="center")
+                    ax.set_title(feat, fontsize=9)
+                    continue
+
+                bin_cats = list(binned.cat.categories)
+                means = [
+                    float(y_arr[binned.eq(b)].mean())
+                    if int(binned.eq(b).sum()) > 0
+                    else float("nan")
+                    for b in bin_cats
+                ]
+                cnts = [int(binned.eq(b).sum()) for b in bin_cats]
+                x = np.arange(len(bin_cats))
+
+                ax.plot(x, means, color=_FEATURE_COLOR, linewidth=2, marker="o", markersize=5)
+                ax.fill_between(x, means, alpha=0.12, color=_FEATURE_COLOR)
+
+                ax2 = ax.twinx()
+                ax2.bar(x, cnts, color="#CCCCCC", alpha=0.35, zorder=0)
+                ax2.set_ylabel("Count", fontsize=8, color="#888888")
+                ax2.tick_params(axis="y", labelsize=7, labelcolor="#888888")
+
+                ax.set_xticks(x)
+                ax.set_xticklabels(
+                    [str(b) for b in bin_cats], rotation=45, ha="right", fontsize=7
+                )
+
+            ax.set_ylabel(y_label, fontsize=8)
+            ax.set_title(feat, fontsize=9, fontweight="bold")
+            ax.spines["top"].set_visible(False)
+
+        # Hide unused axes
+        for idx in range(len(feats), nrows * ncols):
+            axes[idx // ncols][idx % ncols].set_visible(False)
+
+        task_label = "binary" if self._is_binary else "regression"
+        fig.suptitle(
+            f"Feature Response Curves ({task_label})  —  top {len(feats)} selected features",
+            fontsize=11,
+            y=1.01,
+        )
+        fig.tight_layout()
+        return fig
+
     def plot_feature_correlations(self) -> Figure:
-        """Heatmap of Spearman correlations among selected features (masked at threshold).
+        """Heatmap of Spearman correlations among selected features, ordered by cluster.
 
         Raises:
-            RuntimeError: If refinement was not run or fit() was not called.
+            RuntimeError: If fit() was not called or no features were selected.
         """
-        if not self.refinement_enabled or self.feature_correlation_.empty:
+        _require_fitted(self, "plot_feature_correlations()")
+        if self.feature_correlation_.empty:
             raise RuntimeError(
-                "refinement_enabled must be True and fit() must be called first"
+                "No features selected or no correlation to display. "
+                "Ensure fit() produced at least 2 selected features."
             )
 
         import matplotlib.pyplot as plt
 
+        feats = self.feature_correlation_.index.tolist()
         corr = self.feature_correlation_.astype(float)
         n = len(corr)
-        fig, ax = plt.subplots(figsize=(max(5, n), max(4, n)))
 
+        fig, ax = plt.subplots(figsize=(max(5, n), max(4, n)))
         values = corr.to_numpy(dtype=float)
-        vmax = float(np.nanmax(np.abs(values))) if not np.isnan(values).all() else 1.0
-        im = ax.imshow(values, cmap="RdBu_r", vmin=-vmax, vmax=vmax, aspect="auto")
-        plt.colorbar(im, ax=ax, label="Spearman ρ")
+
+        upper_mask = np.triu(np.ones((n, n), dtype=bool), k=1)
+        display_values = np.where(upper_mask, np.nan, values)
+
+        vmax = float(np.nanmax(np.abs(np.where(np.isnan(display_values), 0.0, display_values)))) or 1.0
+        im = ax.imshow(display_values, cmap="RdBu_r", vmin=-vmax, vmax=vmax, aspect="auto")
+        plt.colorbar(im, ax=ax, label="Spearman rho")
 
         for i in range(n):
-            for j in range(n):
-                val = values[i, j]
+            for j in range(i + 1):
+                val = display_values[i, j]
                 if np.isfinite(val):
                     ax.text(j, i, f"{val:.2f}", ha="center", va="center", fontsize=8)
 
         ax.set_xticks(range(n))
-        ax.set_xticklabels(corr.columns.tolist(), rotation=45, ha="right", fontsize=8)
+        ax.set_xticklabels(feats, rotation=45, ha="right", fontsize=8)
         ax.set_yticks(range(n))
-        ax.set_yticklabels(corr.index.tolist(), fontsize=8)
-        ax.set_title(f"Feature Correlation (NaN where |ρ| < {self.correlation_threshold})")
+        ax.set_yticklabels(feats, fontsize=8)
+        ax.set_title(
+            f"Feature Correlation  |rho| >= {self.correlation_threshold}",
+            fontsize=10,
+        )
         fig.tight_layout()
         return fig
 
     def plot_interactions(self, top_n: int = 5) -> dict[str, Figure]:
         """Return one diagnostic figure per top-N ranked interaction pair.
+
+        Each figure has three panels:
+        - Left: hexbin of mean interaction effect (depth-2 − depth-1), RdBu_r
+        - Centre: conditional mean of y in the same feature space, YlOrRd
+        - Right: bootstrap lift vs null distribution
 
         Raises:
             RuntimeError: If find_interactions() has not been called.
@@ -464,99 +596,117 @@ class FeatureSelector:
             figures[key] = self._plot_pair(feat_a, feat_b, row, pair_boot)
         return figures
 
-    def plot_interaction_surface(
+    def to_html(
         self,
-        feature_a: str,
-        feature_b: str,
-        mode: str = "actionable",
-        surface_smoother: str = "random_forest",
-        winsorize_quantiles: tuple[float, float] = (0.01, 0.99),
-        materiality_threshold: float | None = None,
-        show_raw_points: bool = True,
-        show_zero_contour: bool = True,
-        max_scatter_points: int = 10000,
-        min_support: int = 100,
-        random_state: int | None = None,
-    ) -> Figure:
-        """Return an actionable interaction surface plot for a single feature pair."""
-        if not self._interactions_fitted:
-            raise RuntimeError("Call find_interactions() before plot_interaction_surface()")
-        valid_modes = {"actionable", "smooth_contour", "sliced_curves", "heatmap", "hexbin"}
-        if mode not in valid_modes:
-            raise ValueError(f"mode must be one of {valid_modes!r}")
-        for feat in (feature_a, feature_b):
-            if feat not in self._candidate_features:
-                raise ValueError(
-                    f"{feat!r} was not in features passed to fit(); "
-                    f"available: {self._candidate_features}"
-                )
+        path: str | None = None,
+        title: str | None = None,
+        top_n: int = 5,
+    ) -> str:
+        """Render a self-contained HTML report and optionally write it to disk.
 
-        rng_seed = random_state if random_state is not None else self.random_state
-        summary_row = self._lookup_pair_summary(feature_a, feature_b)
-        pair_type = self._infer_pair_plot_type(feature_a, feature_b)
-        is_cat_a = feature_a in self._categorical_features
-        is_cat_b = feature_b in self._categorical_features
+        Sections:
+        1. Summary (task, obs count, selection thresholds)
+        2. Feature ranking table (top_n rows)
+        3. Feature selection figure
+        4. Correlation & clusters (always shown after fit)
+        5. Interactions (shown if find_interactions() was called)
 
-        effective_mode = mode
-        if mode == "actionable":
-            effective_mode = {
-                "continuous_continuous": "smooth_contour",
-                "categorical_continuous": "sliced_curves",
-                "categorical_categorical": "heatmap",
-            }[pair_type]
+        Args:
+            path: Optional file path to write the HTML. If None, returns the string only.
+            title: Report title. Defaults to "Feature Selection Report".
+            top_n: Number of top features in the ranking table and top pairs in interactions.
 
-        val_idx, net = self._one_shot_net_predict(feature_a, feature_b, is_cat_a, is_cat_b)
-
-        if materiality_threshold is None:
-            q25, q75 = np.nanpercentile(np.abs(net), [25, 75])
-            materiality_threshold = max(float(q75 - q25) * 0.1, 1e-6)
-
+        Returns:
+            The full HTML string.
+        """
+        _require_fitted(self, "to_html()")
         import matplotlib.pyplot as plt
 
-        fig, (ax_main, ax_rec) = plt.subplots(
-            1, 2, figsize=(16, 6), gridspec_kw={"width_ratios": [3, 1]}
+        effective_title = title or "Feature Selection Report"
+        generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+        metric_label = "Mean Gini (2·AUC−1)" if self._is_binary else "Mean Spearman ρ"
+        task_label = "binary" if self._is_binary else "regression"
+
+        exec_items: list[tuple[str, str]] = [
+            ("Task", task_label),
+            ("Observations", f"{len(self._X):,}"),
+            ("Features evaluated", str(len(self._candidate_features))),
+            ("Features selected", str(len(self.selected_features_))),
+            ("Bootstrap runs", str(self.n_bootstraps)),
+            ("Null beat rate threshold", f"{self.null_beat_rate_threshold:.0%}"),
+            ("Positive score rate threshold", f"{self.positive_score_rate_threshold:.0%}"),
+        ]
+
+        ranking_cols = [
+            "feature", "dtype", "mean_robust_metric", "std_robust_metric",
+            "null_beat_rate", "positive_score_rate", "selected",
+        ]
+        ranking_cols = [c for c in ranking_cols if c in self.summary_.columns]
+        top_summary = self.summary_.head(top_n)[ranking_cols].copy()
+        col_labels = {
+            "feature": "Feature",
+            "dtype": "Type",
+            "mean_robust_metric": metric_label,
+            "std_robust_metric": "Std",
+            "null_beat_rate": "Null Beat Rate",
+            "positive_score_rate": "Positive Score Rate",
+            "selected": "Selected",
+        }
+
+        try:
+            sel_fig = self.plot_selected_features(top_n=min(top_n * 4, len(self.summary_)))
+            selection_fig_b64: str | None = _fs_figure_to_base64(sel_fig)
+            plt.close(sel_fig)
+        except Exception:
+            selection_fig_b64 = None
+
+        corr_fig_b64: str | None = None
+        if not self.feature_correlation_.empty:
+            try:
+                corr_fig = self.plot_feature_correlations()
+                corr_fig_b64 = _fs_figure_to_base64(corr_fig)
+                plt.close(corr_fig)
+            except Exception:
+                pass
+
+        interaction_figs: list[tuple[str, str | None]] = []
+        if self._interactions_fitted and not self.interaction_summary_.empty:
+            for _, row in self.interaction_summary_.head(top_n).iterrows():
+                fa, fb = str(row["feature_1"]), str(row["feature_2"])
+                pair_label = f"{fa} × {fb}"
+                try:
+                    pair_boot = self.interaction_bootstrap_results_.loc[
+                        self.interaction_bootstrap_results_["feature_1"].eq(fa)
+                        & self.interaction_bootstrap_results_["feature_2"].eq(fb)
+                    ]
+                    fig = self._plot_pair(fa, fb, row, pair_boot)
+                    img_b64: str | None = _fs_figure_to_base64(fig)
+                    plt.close(fig)
+                except Exception:
+                    img_b64 = None
+                interaction_figs.append((pair_label, img_b64))
+
+        html_str = _build_fs_html_report(
+            title=effective_title,
+            generated_at=generated_at,
+            exec_items=exec_items,
+            ranking_df=top_summary,
+            col_labels=col_labels,
+            metric_label=metric_label,
+            selection_fig_b64=selection_fig_b64,
+            corr_fig_b64=corr_fig_b64,
+            interaction_summary=(
+                self.interaction_summary_ if self._interactions_fitted else None
+            ),
+            interaction_figs=interaction_figs,
+            top_n=top_n,
         )
 
-        _nan = float("nan")
-        lift = float(summary_row["mean_interaction_lift"]) if summary_row is not None else _nan
-        nbr = float(summary_row["interaction_null_beat_rate"]) if summary_row is not None else _nan
-        fig.suptitle(
-            f"Actionable Interaction Surface: {feature_a} × {feature_b}   "
-            f"(mean lift={lift:.4f}, null beat rate={nbr:.0%})",
-            fontsize=12,
-        )
+        if path is not None:
+            import pathlib
+            pathlib.Path(path).write_text(html_str, encoding="utf-8")
 
-        shape: str = "unclear"
-        warnings: list[str] = []
-        xx: np.ndarray[Any, Any] | None = None
-        yy: np.ndarray[Any, Any] | None = None
-        zz: np.ndarray[Any, Any] | None = None
-
-        if effective_mode in ("smooth_contour", "hexbin"):
-            shape, warnings, xx, yy, zz = self._plot_smooth_contour(
-                feature_a, feature_b, val_idx, net,
-                winsorize_quantiles, show_raw_points, show_zero_contour,
-                materiality_threshold, max_scatter_points, rng_seed,
-                effective_mode == "hexbin", ax_main,
-            )
-        elif effective_mode == "sliced_curves":
-            cat_feat = feature_a if is_cat_a else feature_b
-            cont_feat = feature_b if is_cat_a else feature_a
-            shape, warnings = self._plot_sliced_interaction_curves(
-                cont_feat, cat_feat, val_idx, net, min_support, ax_main
-            )
-        else:
-            shape, warnings = self._plot_support_heatmap(
-                feature_a, feature_b, val_idx, net, min_support, ax_main
-            )
-
-        self._render_recommendation_panel(
-            feature_a, feature_b, pair_type, shape, warnings,
-            materiality_threshold, summary_row, xx, yy, zz, ax_rec,
-        )
-        ax_rec.set_title("Suggested respecification", fontsize=10, pad=8)
-        fig.tight_layout()
-        return fig
+        return html_str
 
     # --- Private: build summaries ---
 
@@ -642,75 +792,7 @@ class FeatureSelector:
         summary["rank"] = np.arange(1, len(summary) + 1)
         return summary
 
-    # --- Private: refinement ---
-
-    def _run_refinement(self, y: pd.Series) -> None:
-        n_obs = len(self._X)
-        positions = np.arange(n_obs)
-        rng = np.random.default_rng(self.random_state + 1_234_567)
-        train_size = max(1, min(n_obs - 1, int(round((1.0 - self.test_size) * n_obs))))
-        y_arr = y.to_numpy(dtype=float)
-
-        imp_rows: list[dict[str, Any]] = []
-        for boot_id in range(self.n_refinement_bootstraps):
-            tr_idx = np.sort(rng.choice(positions, size=train_size, replace=False))
-            vl_idx = np.setdiff1d(positions, tr_idx)
-            if len(vl_idx) == 0:
-                continue
-
-            enc_arrays: dict[str, np.ndarray[Any, Any]] = {}
-            for feat in self.selected_features_:
-                is_cat = feat in self._categorical_features
-                enc_arrays[feat] = _encode_feature(self._X[feat], is_cat, tr_idx)
-
-            X_tr = pd.DataFrame({f: enc_arrays[f][tr_idx] for f in self.selected_features_})
-            X_vl = pd.DataFrame({f: enc_arrays[f][vl_idx] for f in self.selected_features_})
-            train_y = y_arr[tr_idx]
-            val_y = y_arr[vl_idx]
-            train_mean = float(np.mean(train_y))
-
-            model = self._build_model(depth=3, seed=self.random_state + boot_id)
-            model.fit(X_tr, train_y)
-            baseline_pred = np.asarray(model.predict(X_vl), dtype=float)
-            baseline_r2 = _oof_r2(val_y, baseline_pred, train_mean, None)
-
-            for feat in self.selected_features_:
-                X_vl_perm = X_vl.copy()
-                X_vl_perm[feat] = rng.permutation(X_vl_perm[feat].to_numpy())
-                perm_pred = np.asarray(model.predict(X_vl_perm), dtype=float)
-                perm_r2 = _oof_r2(val_y, perm_pred, train_mean, None)
-                imp_rows.append({
-                    "feature": feat,
-                    "marginal_importance": baseline_r2 - perm_r2,
-                })
-
-        if not imp_rows:
-            return
-
-        raw = pd.DataFrame(imp_rows)
-        refinement_rows: list[dict[str, Any]] = []
-        pruned: set[str] = set()
-
-        for feat in self.selected_features_:
-            feat_imp = raw.loc[raw["feature"] == feat, "marginal_importance"]
-            mean_imp = float(feat_imp.mean()) if len(feat_imp) else float("nan")
-            std_imp = float(feat_imp.std(ddof=0)) if len(feat_imp) else float("nan")
-            pct_non_positive = float((feat_imp <= 0).mean()) if len(feat_imp) else 1.0
-            kept = pct_non_positive <= 0.50
-            if not kept:
-                pruned.add(str(feat))
-            refinement_rows.append({
-                "feature": feat,
-                "mean_marginal_importance": mean_imp,
-                "std_marginal_importance": std_imp,
-                "kept": kept,
-            })
-
-        self.refinement_summary_ = pd.DataFrame(refinement_rows)
-        self.selected_features_ = [f for f in self.selected_features_ if f not in pruned]
-
-        if len(self.selected_features_) >= 2:
-            self.feature_correlation_ = self._compute_feature_correlation()
+    # --- Private: correlation ---
 
     def _compute_feature_correlation(self) -> pd.DataFrame:
         feats = self.selected_features_
@@ -746,46 +828,44 @@ class FeatureSelector:
         self,
         X: pd.DataFrame,
         y: pd.Series | None,
-        group_values: pd.Series | None,
-        custom_splits: Sequence[CustomSplitLike] | None,
+        group_series: pd.Series | None,
+        custom_splits: list[CustomSplitLike] | None,
     ) -> list[_SplitSpec]:
-        if custom_splits is not None:
-            return _normalize_custom_splits(custom_splits, X.index)
-
         n_obs = len(X)
         positions = np.arange(n_obs)
 
-        if self.split_strategy == "group_kfold":
-            if group_values is None:
-                raise ValueError("group_col is required when split_strategy='group_kfold'")
-            if pd.Series(group_values).nunique(dropna=False) < self.n_splits:
-                raise ValueError("group_col must contain at least n_splits unique groups")
-            splitter = GroupKFold(n_splits=self.n_splits)
-            return [
-                _SplitSpec(split_id=i, train_idx=np.asarray(tr), validation_idx=np.asarray(vl))
-                for i, (tr, vl) in enumerate(splitter.split(X, groups=group_values))
-            ]
+        if custom_splits is not None:
+            return _normalize_custom_splits(custom_splits)
 
         if self.split_strategy == "repeated_kfold":
             splits: list[_SplitSpec] = []
-            repeat_count = int(np.ceil(self.n_bootstraps / self.n_splits))
-            for repeat in range(repeat_count):
+            for repeat in range(max(1, self.n_bootstraps // self.n_splits)):
                 kf = KFold(
                     n_splits=self.n_splits,
                     shuffle=True,
                     random_state=self.random_state + repeat,
                 )
-                for tr, vl in kf.split(X):
+                for fold_idx, (tr, vl) in enumerate(kf.split(X)):
                     splits.append(
                         _SplitSpec(
                             split_id=len(splits),
-                            train_idx=np.asarray(tr),
-                            validation_idx=np.asarray(vl),
+                            train_idx=np.sort(tr),
+                            validation_idx=np.sort(vl),
                         )
                     )
                     if len(splits) >= self.n_bootstraps:
                         return splits
             return splits
+
+        if self.split_strategy == "group_kfold":
+            if group_series is None:
+                raise ValueError("group_col is required for group_kfold split strategy")
+            groups = group_series.to_numpy()
+            gkf = GroupKFold(n_splits=self.n_splits)
+            return [
+                _SplitSpec(split_id=i, train_idx=np.sort(tr), validation_idx=np.sort(vl))
+                for i, (tr, vl) in enumerate(gkf.split(X, groups=groups))
+            ]
 
         rng = np.random.default_rng(self.random_state)
         train_size = max(1, min(n_obs - 1, int(round((1.0 - self.test_size) * n_obs))))
@@ -884,18 +964,17 @@ class FeatureSelector:
         )
         is_cat_a = feat_a in self._categorical_features
         is_cat_b = feat_b in self._categorical_features
+        val_idx, net = self._one_shot_net_predict(feat_a, feat_b, is_cat_a, is_cat_b)
 
         if not is_cat_a and not is_cat_b:
-            val_idx, net = self._one_shot_net_predict(feat_a, feat_b, is_cat_a, is_cat_b)
-            self._plot_scatter_interaction(feat_a, feat_b, val_idx, net, axes[0])
-            self._plot_target_scatter(feat_a, feat_b, val_idx, axes[1])
+            self._plot_interaction_hexbin(feat_a, feat_b, val_idx, net, axes[0])
+            self._plot_target_hexbin(feat_a, feat_b, val_idx, axes[1])
         elif is_cat_a != is_cat_b:
             cat_feat = feat_a if is_cat_a else feat_b
             cont_feat = feat_b if is_cat_a else feat_a
-            self._plot_conditional_curves(cont_feat, cat_feat, axes[0])
+            self._plot_sliced_interaction_curves(cont_feat, cat_feat, val_idx, net, 30, axes[0])
             self._plot_target_conditional_curves(cont_feat, cat_feat, axes[1])
         else:
-            val_idx, net = self._one_shot_net_predict(feat_a, feat_b, is_cat_a, is_cat_b)
             self._plot_interaction_bubbles(feat_a, feat_b, val_idx, net, axes[0])
             self._plot_target_bubbles(feat_a, feat_b, val_idx, axes[1])
 
@@ -956,141 +1035,78 @@ class FeatureSelector:
         ]
         return row.iloc[0] if not row.empty else None
 
-    def _plot_smooth_contour(
+    def _plot_interaction_hexbin(
         self,
         feat_a: str,
         feat_b: str,
         val_idx: np.ndarray[Any, Any],
         net: np.ndarray[Any, Any],
-        winsorize_quantiles: tuple[float, float],
-        show_raw_points: bool,
-        show_zero_contour: bool,
-        materiality_threshold: float,
-        max_scatter_points: int,
-        random_state: int,
-        hexbin_mode: bool,
         ax: Any,
-    ) -> tuple[str, list[str], np.ndarray[Any, Any], np.ndarray[Any, Any], np.ndarray[Any, Any]]:
+    ) -> None:
         import matplotlib.pyplot as plt
 
-        lo_q, hi_q = winsorize_quantiles
-        vals_a = pd.to_numeric(self._X[feat_a], errors="coerce").to_numpy(dtype=float)[val_idx]
-        vals_b = pd.to_numeric(self._X[feat_b], errors="coerce").to_numpy(dtype=float)[val_idx]
-
+        vals_a = pd.to_numeric(self._X[feat_a], errors="coerce").iloc[val_idx].to_numpy(
+            dtype=float
+        )
+        vals_b = pd.to_numeric(self._X[feat_b], errors="coerce").iloc[val_idx].to_numpy(
+            dtype=float
+        )
         valid = np.isfinite(vals_a) & np.isfinite(vals_b) & np.isfinite(net)
-        vals_a, vals_b, net_v = vals_a[valid], vals_b[valid], net[valid]
-
-        _empty: np.ndarray[Any, Any] = np.array([])
-        if len(vals_a) < 10:
-            ax.text(0.5, 0.5, "Insufficient data for surface", ha="center", va="center")
+        if valid.sum() < 5:
+            ax.text(0.5, 0.5, "Insufficient data", ha="center", va="center")
             ax.axis("off")
-            return "unclear", ["Insufficient validation data"], _empty, _empty, _empty
+            return
 
-        a_lo = float(np.nanpercentile(vals_a, lo_q * 100))
-        a_hi = float(np.nanpercentile(vals_a, hi_q * 100))
-        b_lo = float(np.nanpercentile(vals_b, lo_q * 100))
-        b_hi = float(np.nanpercentile(vals_b, hi_q * 100))
-        a_lo, a_hi = (a_lo - 1, a_hi + 1) if a_lo == a_hi else (a_lo, a_hi)
-        b_lo, b_hi = (b_lo - 1, b_hi + 1) if b_lo == b_hi else (b_lo, b_hi)
-
-        va = np.clip(vals_a, a_lo, a_hi)
-        vb = np.clip(vals_b, b_lo, b_hi)
-
-        min_leaf = max(30, int(0.01 * len(va)))
-        smoother = RandomForestRegressor(
-            n_estimators=100, max_depth=3, min_samples_leaf=min_leaf,
-            random_state=random_state, n_jobs=1,
+        sc = ax.hexbin(
+            vals_a[valid], vals_b[valid], C=net[valid],
+            reduce_C_function=np.mean, gridsize=25, mincnt=5,
+            cmap="RdBu_r",
         )
-        smoother.fit(np.column_stack([va, vb]), net_v)
-
-        GRID_SIZE = 40
-        xx, yy = np.meshgrid(
-            np.linspace(a_lo, a_hi, GRID_SIZE), np.linspace(b_lo, b_hi, GRID_SIZE)
-        )
-        zz = smoother.predict(np.c_[xx.ravel(), yy.ravel()]).reshape(xx.shape)
-
-        if hexbin_mode:
-            sc = ax.hexbin(
-                va, vb, C=net_v, reduce_C_function=np.mean,
-                gridsize=25, mincnt=3, cmap="RdBu_r",
-            )
-            plt.colorbar(sc, ax=ax, label="Mean net interaction effect")
-            ax.set_title(f"Hexbin: {feat_a} × {feat_b}", fontsize=10)
-        else:
-            vmax = float(max(abs(float(zz.min())), abs(float(zz.max())))) or 1.0
-            cf = ax.contourf(
-                xx, yy, zz, levels=20, cmap="RdBu_r", vmin=-vmax, vmax=vmax, alpha=0.85
-            )
-            plt.colorbar(cf, ax=ax, label="Net interaction effect")
-
-            if show_raw_points:
-                n_pts = len(va)
-                if n_pts > max_scatter_points:
-                    rng = np.random.default_rng(random_state)
-                    sub = rng.choice(n_pts, size=max_scatter_points, replace=False)
-                    ax.scatter(va[sub], vb[sub], s=4, alpha=0.08, color="gray", rasterized=True)
-                else:
-                    ax.scatter(va, vb, s=4, alpha=0.08, color="gray", rasterized=True)
-
-            if show_zero_contour:
-                import contextlib
-                with contextlib.suppress(Exception):
-                    ax.contour(
-                        xx, yy, zz, levels=[0], colors="black",
-                        linestyles="--", linewidths=1.5,
-                    )
-
-            ax.set_title(
-                f"Interaction Surface: {feat_a} × {feat_b}\n"
-                "(smoothed net effect = depth-2 − depth-1)",
-                fontsize=10,
-            )
-
+        arr = sc.get_array()
+        vmax = float(np.nanmax(np.abs(arr))) if arr is not None and len(arr) > 0 else 1.0
+        sc.set_clim(-vmax, vmax)
+        plt.colorbar(sc, ax=ax, label="Mean interaction effect (depth-2 − depth-1)")
         ax.set_xlabel(feat_a)
         ax.set_ylabel(feat_b)
-        if lo_q > 0 or hi_q < 1:
-            ax.text(
-                0.02, 0.02, f"Axes: {lo_q:.0%}–{hi_q:.0%} percentile",
-                transform=ax.transAxes, fontsize=7, color="gray", va="bottom",
-            )
+        ax.set_title(
+            f"Interaction Effect: {feat_a} × {feat_b}\n(hexbin · min 5 obs/bin)",
+            fontsize=10,
+        )
 
-        mat_frac = float(np.mean(np.abs(zz) > materiality_threshold))
-        if mat_frac < 0.05:
-            shape = "unclear"
-        elif mat_frac < 0.35:
-            shape = "local_threshold"
-        else:
-            shape = "smooth_surface"
+    def _plot_target_hexbin(
+        self,
+        feat_a: str,
+        feat_b: str,
+        val_idx: np.ndarray[Any, Any],
+        ax: Any,
+    ) -> None:
+        import matplotlib.pyplot as plt
 
-        warnings: list[str] = []
-        if shape == "local_threshold" and not hexbin_mode:
-            pos_mask = zz > materiality_threshold
-            if pos_mask.any():
-                x_thresh = float(np.nanpercentile(xx[pos_mask], 20))
-                y_thresh = float(np.nanpercentile(yy[pos_mask], 80))
-                for val, axis_dir, lo, hi, feat in [
-                    (x_thresh, "v", a_lo, a_hi, feat_a),
-                    (y_thresh, "h", b_lo, b_hi, feat_b),
-                ]:
-                    if lo < val < hi:
-                        if axis_dir == "v":
-                            ax.axvline(
-                                val, color="#333333", linestyle=":", linewidth=1.2, alpha=0.7
-                            )
-                            ax.text(
-                                val, b_lo, f" {feat}≈{val:.3g}", va="bottom",
-                                fontsize=7, color="#333333",
-                            )
-                        else:
-                            ax.axhline(
-                                val, color="#333333", linestyle=":", linewidth=1.2, alpha=0.7
-                            )
-                            ax.text(
-                                a_lo, val, f" {feat}≈{val:.3g}", va="bottom",
-                                fontsize=7, color="#333333",
-                            )
+        vals_a = pd.to_numeric(self._X[feat_a], errors="coerce").iloc[val_idx].to_numpy(
+            dtype=float
+        )
+        vals_b = pd.to_numeric(self._X[feat_b], errors="coerce").iloc[val_idx].to_numpy(
+            dtype=float
+        )
+        y_vals = self._y.iloc[val_idx].to_numpy(dtype=float)
+        valid = np.isfinite(vals_a) & np.isfinite(vals_b) & np.isfinite(y_vals)
+        if valid.sum() < 5:
+            ax.text(0.5, 0.5, "Insufficient data", ha="center", va="center")
+            ax.axis("off")
+            return
 
-        return shape, warnings, xx, yy, zz
+        sc = ax.hexbin(
+            vals_a[valid], vals_b[valid], C=y_vals[valid],
+            reduce_C_function=np.mean, gridsize=25, mincnt=5,
+            cmap="YlOrRd",
+        )
+        plt.colorbar(sc, ax=ax, label="Mean target value")
+        ax.set_xlabel(feat_a)
+        ax.set_ylabel(feat_b)
+        ax.set_title(
+            f"Conditional Mean y: {feat_a} × {feat_b}\n(hexbin · min 5 obs/bin)",
+            fontsize=10,
+        )
 
     def _plot_sliced_interaction_curves(
         self,
@@ -1101,7 +1117,9 @@ class FeatureSelector:
         min_support: int,
         ax: Any,
     ) -> tuple[str, list[str]]:
-        cont_raw = pd.to_numeric(self._X[cont_feat], errors="coerce").to_numpy(dtype=float)[val_idx]
+        cont_raw = pd.to_numeric(self._X[cont_feat], errors="coerce").to_numpy(dtype=float)[
+            val_idx
+        ]
         cat_raw = self._X[cat_feat].astype(str).to_numpy()[val_idx]
         valid = np.isfinite(cont_raw) & np.array([c != "" for c in cat_raw], dtype=bool)
         cont_arr, cat_arr, net_v = cont_raw[valid], cat_raw[valid], net[valid]
@@ -1147,66 +1165,12 @@ class FeatureSelector:
         ax.set_xlabel(f"{cont_feat} (quantile bins)")
         ax.set_ylabel("Mean net interaction effect")
         ax.set_title(
-            f"Sliced Interaction Curves: {cont_feat} by {cat_feat}\n"
+            f"Interaction Effect: {cont_feat} by {cat_feat}\n"
             "(net effect = depth-2 − depth-1 prediction)",
             fontsize=10,
         )
         ax.legend(title=cat_feat, fontsize=8, framealpha=0.7)
         return "category_specific_slope", warnings
-
-    def _plot_support_heatmap(
-        self,
-        feat_a: str,
-        feat_b: str,
-        val_idx: np.ndarray[Any, Any],
-        net: np.ndarray[Any, Any],
-        min_support: int,
-        ax: Any,
-    ) -> tuple[str, list[str]]:
-        import matplotlib.pyplot as plt
-
-        cats_a = self._X[feat_a].astype(str).value_counts().head(8).index.tolist()
-        cats_b = self._X[feat_b].astype(str).value_counts().head(8).index.tolist()
-        a_arr = self._X[feat_a].astype(str).to_numpy()[val_idx]
-        b_arr = self._X[feat_b].astype(str).to_numpy()[val_idx]
-
-        grid_net = np.full((len(cats_a), len(cats_b)), float("nan"))
-        grid_cnt = np.zeros((len(cats_a), len(cats_b)), dtype=int)
-        warnings: list[str] = []
-
-        for i, ca in enumerate(cats_a):
-            for j, cb in enumerate(cats_b):
-                mask = (a_arr == ca) & (b_arr == cb)
-                cnt = int(mask.sum())
-                grid_cnt[i, j] = cnt
-                if cnt > 0:
-                    grid_net[i, j] = float(net[mask].mean())
-                if 0 < cnt < min_support:
-                    warnings.append(f"Low support: {feat_a}={ca!r}, {feat_b}={cb!r} (n={cnt})")
-
-        vmax = float(np.nanmax(np.abs(grid_net))) if not np.isnan(grid_net).all() else 1.0
-        im = ax.imshow(
-            grid_net, cmap="RdBu_r", vmin=-vmax, vmax=vmax, aspect="auto", origin="upper"
-        )
-        plt.colorbar(im, ax=ax, label="Mean net interaction effect")
-
-        for i in range(len(cats_a)):
-            for j in range(len(cats_b)):
-                cnt = grid_cnt[i, j]
-                if cnt > 0:
-                    color = "red" if cnt < min_support else "black"
-                    ax.text(j, i, f"n={cnt}", ha="center", va="center", fontsize=7, color=color)
-
-        ax.set_xticks(range(len(cats_b)))
-        ax.set_xticklabels(cats_b, rotation=45, ha="right", fontsize=8)
-        ax.set_yticks(range(len(cats_a)))
-        ax.set_yticklabels(cats_a, fontsize=8)
-        ax.set_xlabel(feat_b)
-        ax.set_ylabel(feat_a)
-        ax.set_title(
-            f"Interaction Heatmap: {feat_a} × {feat_b}\n(red n = low support)", fontsize=10
-        )
-        return "cell_effect", warnings
 
     def _plot_interaction_bubbles(
         self,
@@ -1255,83 +1219,11 @@ class FeatureSelector:
         ax.set_ylabel(feat_a)
         ax.set_title("Interaction Effect (bubble size = count)")
 
-    def _plot_scatter_interaction(
-        self,
-        feat_a: str,
-        feat_b: str,
-        val_idx: np.ndarray[Any, Any],
-        net: np.ndarray[Any, Any],
-        ax: Any,
-    ) -> None:
-        import matplotlib.pyplot as plt
-
-        vals_a = pd.to_numeric(self._X[feat_a], errors="coerce").iloc[val_idx].to_numpy(dtype=float)
-        vals_b = pd.to_numeric(self._X[feat_b], errors="coerce").iloc[val_idx].to_numpy(dtype=float)
-        vmax = float(np.nanmax(np.abs(net))) if len(net) > 0 else 1.0
-        sc = ax.scatter(
-            vals_a, vals_b, c=net, cmap="RdBu_r",
-            vmin=-vmax, vmax=vmax, alpha=0.6, s=18, rasterized=True,
-        )
-        plt.colorbar(sc, ax=ax, label="Interaction effect (depth-2 − depth-1)")
-        ax.set_xlabel(feat_a)
-        ax.set_ylabel(feat_b)
-        ax.set_title("Interaction Effect")
-
-    def _plot_conditional_curves(self, cont_feat: str, cat_feat: str, ax: Any) -> None:
-        y_vals = self._y.to_numpy(dtype=float)
-        cont_vals = pd.to_numeric(self._X[cont_feat], errors="coerce")
-        cat_vals = self._X[cat_feat].astype(str)
-
-        try:
-            cont_bins = pd.qcut(cont_vals, q=6, duplicates="drop")
-            bin_cats = list(cont_bins.cat.categories)
-        except Exception:
-            ax.text(0.5, 0.5, "Insufficient data for conditional curves", ha="center", va="center")
-            ax.axis("off")
-            return
-
-        colors = ["#2C7FB8", "#E34234", "#2E7D32", "#F28C00", "#7B2D8B"]
-        x = np.arange(len(bin_cats))
-        for i, cat in enumerate(cat_vals.value_counts().head(5).index):
-            cat_mask = cat_vals.eq(cat)
-            means = [
-                float(y_vals[cat_mask & cont_bins.eq(b)].mean())
-                if (cat_mask & cont_bins.eq(b)).sum() >= 5
-                else float("nan")
-                for b in bin_cats
-            ]
-            ax.plot(x, means, marker="o", label=str(cat), color=colors[i % len(colors)])
-
-        ax.axhline(0.0, linestyle=":", color=_ZERO_LINE_COLOR, linewidth=1.0)
-        ax.set_xticks(x)
-        ax.set_xticklabels([str(b) for b in bin_cats], rotation=45, ha="right", fontsize=8)
-        ax.set_xlabel(f"{cont_feat} (quantile bins)")
-        ax.set_ylabel("Mean y")
-        ax.set_title(f"Conditional Effect: {cont_feat} by {cat_feat}")
-        ax.legend(title=cat_feat, fontsize=8, framealpha=0.7)
-
-    def _plot_target_scatter(
-        self,
-        feat_a: str,
-        feat_b: str,
-        val_idx: np.ndarray[Any, Any],
-        ax: Any,
-    ) -> None:
-        import matplotlib.pyplot as plt
-
-        vals_a = pd.to_numeric(self._X[feat_a], errors="coerce").iloc[val_idx].to_numpy(dtype=float)
-        vals_b = pd.to_numeric(self._X[feat_b], errors="coerce").iloc[val_idx].to_numpy(dtype=float)
-        y_vals = self._y.iloc[val_idx].to_numpy(dtype=float)
-        sc = ax.scatter(vals_a, vals_b, c=y_vals, cmap="YlOrRd", alpha=0.6, s=18, rasterized=True)
-        plt.colorbar(sc, ax=ax, label="Target value")
-        ax.set_xlabel(feat_a)
-        ax.set_ylabel(feat_b)
-        ax.set_title("Target Distribution")
-
     def _plot_target_conditional_curves(self, cont_feat: str, cat_feat: str, ax: Any) -> None:
         y_vals = self._y.to_numpy(dtype=float)
         cont_vals = pd.to_numeric(self._X[cont_feat], errors="coerce")
         cat_vals = self._X[cat_feat].astype(str)
+
         try:
             cont_bins = pd.qcut(cont_vals, q=6, duplicates="drop")
             bin_cats = list(cont_bins.cat.categories)
@@ -1356,7 +1248,7 @@ class FeatureSelector:
         ax.set_xticklabels([str(b) for b in bin_cats], rotation=45, ha="right", fontsize=8)
         ax.set_xlabel(f"{cont_feat} (quantile bins)")
         ax.set_ylabel("Mean target value")
-        ax.set_title(f"Target: {cont_feat} by {cat_feat}")
+        ax.set_title(f"Conditional Mean y: {cont_feat} by {cat_feat}")
         ax.legend(title=cat_feat, fontsize=8, framealpha=0.7)
 
     def _plot_target_bubbles(
@@ -1401,7 +1293,7 @@ class FeatureSelector:
         ax.set_yticklabels(cats_a, fontsize=8)
         ax.set_xlabel(feat_b)
         ax.set_ylabel(feat_a)
-        ax.set_title("Target Distribution (bubble size = count)")
+        ax.set_title("Conditional Mean y (bubble size = count)")
 
     def _plot_lift_dist(self, pair_boot: pd.DataFrame, ax: Any) -> None:
         lift = pair_boot["interaction_lift"].dropna()
@@ -1439,91 +1331,212 @@ class FeatureSelector:
         ax.set_title("Interaction Lift vs Null")
         ax.legend(loc="upper left", fontsize=8, framealpha=0.7)
 
-    def _suggest_candidate_terms(
-        self,
-        feat_a: str,
-        feat_b: str,
-        pair_type: str,
-        shape: str,
-        xx: np.ndarray[Any, Any] | None,
-        yy: np.ndarray[Any, Any] | None,
-        zz: np.ndarray[Any, Any] | None,
-        materiality_threshold: float,
-    ) -> str:
-        if shape == "local_threshold" and pair_type == "continuous_continuous" and zz is not None:
-            pos_mask = zz > materiality_threshold
-            if pos_mask.any():
-                x_thresh = float(np.nanpercentile(xx[pos_mask], 20))  # type: ignore[index]
-                y_thresh = float(np.nanpercentile(yy[pos_mask], 80))  # type: ignore[index]
-                return f"I({feat_a} > {x_thresh:.4g})\n  × I({feat_b} < {y_thresh:.4g})"
-            return f"threshold({feat_a}) × threshold({feat_b})"
-        if shape == "smooth_surface" and pair_type == "continuous_continuous":
-            return f"spline({feat_a}) × spline({feat_b})\nor tensor product spline"
-        if shape == "category_specific_slope":
-            cat_feat = feat_a if feat_a in self._categorical_features else feat_b
-            cont_feat = feat_b if feat_a in self._categorical_features else feat_a
-            return (
-                f"{cat_feat}_group\n  × spline({cont_feat})\nor"
-                f"\n  × I({cont_feat} > threshold)"
-            )
-        if shape == "cell_effect":
-            return f"{feat_a} × {feat_b}\n(category interaction terms)"
-        return "Inspect surface;\nsignal may be weak"
 
-    def _render_recommendation_panel(
-        self,
-        feat_a: str,
-        feat_b: str,
-        pair_type: str,
-        shape: str,
-        warnings: list[str],
-        materiality_threshold: float,
-        summary_row: pd.Series | None,
-        xx: np.ndarray[Any, Any] | None,
-        yy: np.ndarray[Any, Any] | None,
-        zz: np.ndarray[Any, Any] | None,
-        ax: Any,
-    ) -> None:
-        ax.axis("off")
+def _build_fs_html_report(
+    title: str,
+    generated_at: str,
+    exec_items: list[tuple[str, str]],
+    ranking_df: pd.DataFrame,
+    col_labels: dict[str, str],
+    metric_label: str,
+    selection_fig_b64: str | None,
+    corr_fig_b64: str | None,
+    interaction_summary: pd.DataFrame | None,
+    interaction_figs: list[tuple[str, str | None]],
+    top_n: int,
+) -> str:
+    css = """
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      font-size: 14px; line-height: 1.65; color: #222; background: #fff;
+      max-width: 1200px; margin: 0 auto; padding: 44px 36px;
+    }
+    .report-header { border-top: 3px solid #2C7FB8; padding-top: 22px; margin-bottom: 40px; }
+    h1 { font-size: 22px; font-weight: 600; color: #1a1a1a; margin-bottom: 4px; }
+    .meta { font-size: 12px; color: #999; }
+    h2 {
+      font-size: 12px; font-weight: 700; color: #2C7FB8;
+      text-transform: uppercase; letter-spacing: 0.07em;
+      margin-top: 44px; margin-bottom: 16px;
+      padding-bottom: 7px; border-bottom: 1px solid #e4e4e4;
+    }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th {
+      text-align: left; font-weight: 600; color: #666;
+      padding: 9px 13px; border-bottom: 2px solid #e4e4e4; white-space: nowrap;
+    }
+    td { padding: 8px 13px; border-bottom: 1px solid #f2f2f2; vertical-align: top; }
+    tr:nth-child(even) td { background: #f9fafb; }
+    td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    .badge {
+      display: inline-block; padding: 2px 8px; border-radius: 3px;
+      font-size: 11px; font-weight: 700; letter-spacing: 0.02em;
+    }
+    .badge-strong { background: #ddeef7; color: #2a6a94; }
+    .badge-moderate { background: #e6f4e6; color: #3a7a3a; }
+    .badge-weak { background: #f0f0f0; color: #999; }
+    .badge-selected { background: #2E7D32; color: #fff; }
+    .fig-block { margin-top: 24px; }
+    .fig-block img { max-width: 100%; height: auto; }
+    .pair-card { margin-top: 36px; padding-top: 24px; border-top: 1px solid #e8e8e8; }
+    .pair-card h3 { font-size: 15px; font-weight: 600; color: #1a1a1a; margin-bottom: 12px; }
+    .pair-card img { max-width: 100%; height: auto; }
+    """
 
-        if summary_row is not None:
-            lift = float(summary_row["mean_interaction_lift"])
-            nbr = float(summary_row["interaction_null_beat_rate"])
-            plr_raw = summary_row.get("positive_lift_rate", float("nan"))
-            plr = float(plr_raw) if plr_raw is not None else float("nan")
-            metrics = (
-                f"Lift: {lift:.4f}\nNull beat rate: {nbr:.0%}\nPositive lift rate: {plr:.0%}"
-            )
-        else:
-            metrics = ""
+    exec_rows = "".join(
+        f"<tr><td>{_html.escape(k)}</td><td class='num'>{_html.escape(v)}</td></tr>"
+        for k, v in exec_items
+    )
 
-        shape_labels = {
-            "local_threshold": "Local threshold interaction",
-            "smooth_surface": "Smooth continuous surface",
-            "category_specific_slope": "Category-specific slope",
-            "cell_effect": "Cell-level cat × cat effect",
-            "unclear": "Unclear / weak signal",
-        }
-        candidate = self._suggest_candidate_terms(
-            feat_a, feat_b, pair_type, shape, xx, yy, zz, materiality_threshold
+    header_cells = "".join(
+        f"<th>{_html.escape(col_labels.get(c, c))}</th>" for c in ranking_df.columns
+    )
+    numeric_cols = {"mean_robust_metric", "std_robust_metric", "positive_score_rate"}
+    ranking_rows_html: list[str] = []
+    for _, row in ranking_df.iterrows():
+        cells: list[str] = []
+        for col in ranking_df.columns:
+            raw = row[col]
+            val_str = str(raw) if pd.notna(raw) else ""
+            if col == "null_beat_rate" and val_str:
+                try:
+                    rate = float(val_str)
+                    badge_cls = (
+                        "badge-strong" if rate > 0.75
+                        else ("badge-moderate" if rate >= 0.50 else "badge-weak")
+                    )
+                    cells.append(
+                        f"<td><span class='badge {badge_cls}'>{rate:.0%}</span></td>"
+                    )
+                    continue
+                except ValueError:
+                    pass
+            if col == "selected":
+                badge = (
+                    "<span class='badge badge-selected'>✓</span>" if bool(raw) else ""
+                )
+                cells.append(f"<td>{badge}</td>")
+                continue
+            td_cls = " class='num'" if col in numeric_cols else ""
+            if col in numeric_cols and val_str:
+                try:
+                    val_str = f"{float(val_str):.3f}"
+                except ValueError:
+                    pass
+            cells.append(f"<td{td_cls}>{_html.escape(val_str)}</td>")
+        ranking_rows_html.append(f"<tr>{''.join(cells)}</tr>")
+
+    selection_img = (
+        f"<div class='fig-block'>"
+        f"<img src='data:image/png;base64,{selection_fig_b64}'>"
+        f"</div>"
+        if selection_fig_b64
+        else "<p><em>Figure unavailable.</em></p>"
+    )
+
+    if corr_fig_b64:
+        corr_section = (
+            f"<h2>Feature Correlation</h2>"
+            f"<div class='fig-block'><img src='data:image/png;base64,{corr_fig_b64}'></div>"
+        )
+    else:
+        corr_section = (
+            "<h2>Feature Correlation</h2>"
+            "<p>Fewer than 2 features were selected — no correlation to compute.</p>"
         )
 
-        lines = [
-            metrics, "",
-            f"Shape:\n  {shape_labels.get(shape, shape)}", "",
-            f"Candidate term:\n  {candidate}",
+    interactions_section = ""
+    if interaction_summary is not None and not interaction_summary.empty:
+        int_cols = [
+            "feature_1", "feature_2", "mean_interaction_lift",
+            "positive_lift_rate", "interaction_null_beat_rate", "rank",
         ]
-        if warnings:
-            capped = warnings[:3]
-            warn_str = "Warnings:\n" + "\n".join(f"  • {w}" for w in capped)
-            if len(warnings) > 3:
-                warn_str += f"\n  (+{len(warnings) - 3} more)"
-            lines += ["", warn_str]
-
-        ax.text(
-            0.05, 0.95, "\n".join(lines).strip(),
-            transform=ax.transAxes, va="top", ha="left",
-            fontsize=8.5, family="monospace", linespacing=1.5,
-            bbox={"boxstyle": "round,pad=0.5", "facecolor": "#f9f9f9", "alpha": 0.95,
-                  "edgecolor": "#cccccc"},
+        int_cols = [c for c in int_cols if c in interaction_summary.columns]
+        int_header = "".join(
+            f"<th>{_html.escape(c.replace('_', ' ').title())}</th>" for c in int_cols
         )
+        int_rows_html: list[str] = []
+        for _, row in interaction_summary.head(top_n).iterrows():
+            cells = []
+            for col in int_cols:
+                raw = row[col]
+                val_str = str(raw) if pd.notna(raw) else ""
+                if col == "interaction_null_beat_rate" and val_str:
+                    try:
+                        rate = float(val_str)
+                        badge_cls = (
+                            "badge-strong" if rate > 0.75
+                            else ("badge-moderate" if rate >= 0.50 else "badge-weak")
+                        )
+                        cells.append(
+                            f"<td><span class='badge {badge_cls}'>{rate:.0%}</span></td>"
+                        )
+                        continue
+                    except ValueError:
+                        pass
+                num_cols_int = {"mean_interaction_lift", "positive_lift_rate"}
+                td_cls = " class='num'" if col in num_cols_int or col == "rank" else ""
+                if col in num_cols_int and val_str:
+                    try:
+                        val_str = f"{float(val_str):.4f}"
+                    except ValueError:
+                        pass
+                cells.append(f"<td{td_cls}>{_html.escape(val_str)}</td>")
+            int_rows_html.append(f"<tr>{''.join(cells)}</tr>")
+
+        pair_cards = "".join(
+            f"<div class='pair-card'>"
+            f"<h3>{_html.escape(pair_label)}</h3>"
+            f"<img src='data:image/png;base64,{img_b64}'>"
+            f"</div>"
+            if img_b64
+            else f"<div class='pair-card'>"
+            f"<h3>{_html.escape(pair_label)}</h3>"
+            f"<p><em>Figure unavailable.</em></p></div>"
+            for pair_label, img_b64 in interaction_figs
+        )
+
+        interactions_section = f"""
+  <h2>Interactions — Top {top_n}</h2>
+  <table>
+    <thead><tr>{int_header}</tr></thead>
+    <tbody>{''.join(int_rows_html)}</tbody>
+  </table>
+  {pair_cards}
+"""
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{_html.escape(title)}</title>
+  <style>{css}</style>
+</head>
+<body>
+  <div class="report-header">
+    <h1>{_html.escape(title)}</h1>
+    <p class="meta">Generated {_html.escape(generated_at)}</p>
+  </div>
+
+  <h2>Summary</h2>
+  <table>
+    <thead><tr><th>Metric</th><th>Value</th></tr></thead>
+    <tbody>{exec_rows}</tbody>
+  </table>
+
+  <h2>Feature Rankings — Top {top_n}</h2>
+  <table>
+    <thead><tr>{header_cells}</tr></thead>
+    <tbody>{''.join(ranking_rows_html)}</tbody>
+  </table>
+
+  <h2>Feature Selection</h2>
+  {selection_img}
+
+  {corr_section}
+
+  {interactions_section}
+</body>
+</html>"""
