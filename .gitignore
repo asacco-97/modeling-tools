@@ -1,0 +1,84 @@
+# Block all local data dumps, raw source files, and binary databases
+data/
+*.csv
+*.parquet
+*.jsonl
+*.pickle
+*.pkl
+*.npy
+*.npz
+*.h5
+*.db
+*.sqlite
+
+# Large model checkpoints and weights
+models/
+*.pt
+*.pth
+*.onnx
+*.bin
+*.pb
+
+# ==========================================
+# Jupyter Notebooks Artifacts
+# ==========================================
+# Ignore checkpoint files generated during autosave
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/*
+
+# Optional: Ignore notebook output formats if you only commit raw .ipynb
+# *.html
+# *.pdf
+
+# ==========================================
+# Secrets and Credentials
+# ==========================================
+# Never track environment files with API keys or database passwords
+.env
+.env.*
+.env.local
+.env.*.local
+
+# But explicitly keep track of the template file if it exists
+!.env.example
+
+# ==========================================
+# Virtual Environments and Packages
+# ==========================================
+# Exclude your local dependencies to keep the repository light
+.coverage
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+.venv/
+env/
+venv/
+ENV/
+bin/
+lib/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+*.egg-info/
+
+# ==========================================
+# IDE and OS Specific Files
+# ==========================================
+# VS Code
+.vscode/
+!.vscode/settings.json
+
+# PyCharm / IntelliJ
+.idea/
+
+# Operating System temporary files
+.DS_Store
+Thumbs.db
+
+# Python bytecode and cache directories
+__pycache__/
+*.pyc
